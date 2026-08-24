@@ -139,10 +139,10 @@ TEST(NvFp4SupportTest, MapsDocumentedFamilyTargets) {
     EXPECT_FALSE(nccl_ep::host_device_supports_fp4(90));
     EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(100), "sm_100f");
     EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(103), "sm_100f");
+    EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(107), "sm_107f");
     EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(110), "sm_110f");
     EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(120), "sm_120f");
     EXPECT_EQ(nccl_ep::host_device_fp4_target_arch(121), "sm_120f");
-    EXPECT_FALSE(nccl_ep::host_device_supports_fp4(107));
 }
 
 // These are exact E2M1 values. Every 16-element block contains +/-6, so the

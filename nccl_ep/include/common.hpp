@@ -104,6 +104,7 @@ inline constexpr std::string_view host_device_fp4_target_arch(unsigned int sm) {
     switch (sm) {
     case 100:
     case 103: return "sm_100f";
+    case 107: return "sm_107f";
     case 110: return "sm_110f";
     case 120:
     case 121: return "sm_120f";

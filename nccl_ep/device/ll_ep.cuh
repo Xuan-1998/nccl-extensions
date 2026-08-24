@@ -1812,7 +1812,8 @@ __forceinline__ __device__ void processAndSendToken(
 // The arithmetic below mirrors DeepEP's extension_kernels.cu NVFP4 helpers.
 // Keep its operation order intact: quantization recipes are precision-sensitive.
 #if defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && \
-    (__CUDA_ARCH_FAMILY_SPECIFIC__ == 1000 || __CUDA_ARCH_FAMILY_SPECIFIC__ == 1100 || \
+    (__CUDA_ARCH_FAMILY_SPECIFIC__ == 1000 || __CUDA_ARCH_FAMILY_SPECIFIC__ == 1070 || \
+     __CUDA_ARCH_FAMILY_SPECIFIC__ == 1100 || \
      __CUDA_ARCH_FAMILY_SPECIFIC__ == 1200)
 __device__ __forceinline__ float nvfp4_rcp(float a) {
     float b;
@@ -1913,8 +1914,8 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
   int numWarpGroups, int numWarpsPerGroup, int phases, bool zeroCopy, int numComms, ncclDevComm* devComms,
   const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles) {
 #if !defined(__CUDA_ARCH_FAMILY_SPECIFIC__) || \
-    (__CUDA_ARCH_FAMILY_SPECIFIC__ != 1000 && __CUDA_ARCH_FAMILY_SPECIFIC__ != 1100 && \
-     __CUDA_ARCH_FAMILY_SPECIFIC__ != 1200)
+    (__CUDA_ARCH_FAMILY_SPECIFIC__ != 1000 && __CUDA_ARCH_FAMILY_SPECIFIC__ != 1070 && \
+     __CUDA_ARCH_FAMILY_SPECIFIC__ != 1100 && __CUDA_ARCH_FAMILY_SPECIFIC__ != 1200)
     if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
         nvfp4_unsupported_device();
         return;
