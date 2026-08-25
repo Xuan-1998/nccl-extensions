@@ -130,33 +130,13 @@ names the struct and the **Field** column names the field within it.
 **Dimensions:**
 * B = batch size
 * H = hidden dimension
-* S = scales dimension
 * L = number of local experts
 * K = top K
 * R = number of ranks (nRanks)
 * N(r) = number of tokens targeting rank r
 
-`NCCL_EP_DISP_QUANT_FWD` forwards the physical bytes of two 2D
-inputs: tokens `[B x H]` and scales `[B x S]`. `S` is taken directly from the
-scale tensor; the recipe does not infer a scale-block size. Tokens may use
-FP32, FP16, BF16, FP8, or `ncclFloat4x2`; scales may use FP32, FP16, BF16,
-FP8, or `ncclUint8` raw byte storage. Each physical row and storage base (or
-window offset) must be 16-byte aligned. `ncclFloat4x2` is a packed pair of
-logical FP4 values: for logical hidden size `H`, use physical token shape
-`[B x H/2]` (so `sizes[1]` is `H/2`, not `H`). The token row alignment rule
-requires `H` to be a multiple of 32; the independently supplied scale row must
-also be 16-byte aligned. EP only byte-forwards this reserved type—NCCL
-collectives do not yet support it. Dispatch scale outputs have the same leading
-layout dimensions as token outputs and `S` as their final dimension. In LL
-rank-major mode, token and scale output descriptors can independently be backed
-by NCCL windows. See the full public API contract in `nccl_ep.h`.
-
-`NCCL_EP_COMB_QUANT_NVFP4` is an experimental LL-only combine recipe for BF16
-expert outputs, supported only on NVFP4-capable devices. Set
-`combine_config.quant_recipe` accordingly and provide one FP32 scale per valid
-expert-output row through `combine_inputs.scales`. The scale tensor is 3D with
-the same leading dimensions as `combine_inputs.tokens` and a final dimension of
-one; each scale is `2688 / amax(abs(row))`, computed from the post-expert BF16 row.
+For quantization recipes, tensor contracts, and `max_token_bytes` sizing, see
+[Quantization](quantization.md).
 
 
 #### LL mode (same data type)
@@ -416,7 +396,7 @@ typedef struct {
                                                 //   HT: required (must be >= max_dispatch_tokens_per_rank)
                                                 //   LL: unused (buffers always sized automatically); pass NCCL_EP_AUTO
     unsigned int max_token_bytes;               // Max token-row bytes. For quantized transmission, quantized
-                                                //   token data and scales must fit within this budget.
+                                                //   token data and scales must fit within this budget; see quantization.md.
     unsigned long int rdma_buffer_size;         // RDMA buffer size for LL mode.
                                                 //   NCCL_EP_AUTO  → lazy: allocate on first ncclEpInitHandle, sized to that
                                                 //                  handle's actual (layout, num_topk); collective re-grow
@@ -446,11 +426,6 @@ version returned by `ncclEpGetVersion` before relying on it. Historical
 `ncclEpGroupConfig_t::version` records the caller's
 `NCCL_EP_API_VERSION`; a mismatch is reported as a warning rather than
 rejecting an otherwise size-compatible configuration.
-
-`max_token_bytes` is a per-token physical-byte budget. For quantized
-transmission, quantized token data and scales must fit within it; for example,
-packed FP4 uses `H/2` token bytes plus `S * sizeof(scale_dtype)` scale bytes. HT
-requires the configured bound to be a multiple of 16 bytes.
 
 ### `ncclEpHandle_t` - Operation Handle
 
