@@ -310,6 +310,9 @@ case "${NCCL_M2N_MPI_TEST_PROFILE}" in
     runCase "direct, all APIs" --algorithm direct --api all --lb-mode uniform
     runCase "pack, default API" --algorithm ring --api default \
       --copy-algorithm pack --lb-mode uniform
+    runCase "pack reduced-bucket regressions" --filter pack_reduced_bucket \
+      --algorithm ring --api default --copy-algorithm pack --lb-mode uniform \
+      --gtest_filter='PackMpiTest.ReducedBucket*'
     NCCL_RESHARD_STAGING_CHANNEL_SIZE=4194304 \
       runCase "staging slot pressure" --filter staging_slot_pressure \
       --algorithm ring --api default --lb-mode uniform

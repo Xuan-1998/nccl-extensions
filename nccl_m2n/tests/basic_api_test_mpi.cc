@@ -158,23 +158,26 @@ struct ReducedBucketTestContext {
   cudaStream_t streamB = nullptr;
   void* bufferA = nullptr;
   void* bufferB = nullptr;
-  ncclMesh_t srcMesh{};
-  ncclMesh_t dstMesh{};
-  ncclDistTensor_t srcA{};
-  ncclDistTensor_t dstA{};
-  ncclDistTensor_t srcB{};
-  ncclDistTensor_t dstB{};
+  int meshDims[2] = {1, 1};
+  size_t localShape[1] = {kReducedBucketBytes};
+  int placements[2] = {NCCL_RESHARD_REPLICATE, NCCL_RESHARD_REPLICATE};
+  ncclMesh_t srcMesh = NCCL_M2N_MESH_INITIALIZER;
+  ncclMesh_t dstMesh = NCCL_M2N_MESH_INITIALIZER;
+  ncclDistTensor_t srcA = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+  ncclDistTensor_t dstA = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+  ncclDistTensor_t srcB = NCCL_M2N_DIST_TENSOR_INITIALIZER;
+  ncclDistTensor_t dstB = NCCL_M2N_DIST_TENSOR_INITIALIZER;
 };
 
-static ncclDistTensor_t makeReducedBucketTensor(void* data, ncclMesh_t* mesh) {
-  ncclDistTensor_t tensor{};
+static ncclDistTensor_t makeReducedBucketTensor(void* data, ncclMesh_t* mesh, size_t* localShape,
+                                                int* placements) {
+  ncclDistTensor_t tensor = NCCL_M2N_DIST_TENSOR_INITIALIZER;
   tensor.dataPtr = data;
-  tensor.localShape[0] = kReducedBucketBytes;
+  tensor.localShape = localShape;
   tensor.ndims = 1;
   tensor.dtype = ncclUint8;
   tensor.mesh = mesh;
-  tensor.placements[0] = NCCL_RESHARD_REPLICATE;
-  tensor.placements[1] = NCCL_RESHARD_REPLICATE;
+  tensor.placements = placements;
   return tensor;
 }
 
@@ -204,15 +207,20 @@ static void initializeReducedBucketTest(ReducedBucketTestContext* ctx, ncclComm_
     TEST_CUDACHECK(cudaMalloc(&ctx->bufferB, kReducedBucketBytes));
   }
 
-  ctx->srcMesh.dims[0] = 1;
-  ctx->srcMesh.dims[1] = 1;
+  ctx->srcMesh.ndims = 2;
+  ctx->srcMesh.dims = ctx->meshDims;
   ctx->srcMesh.startRank = 0;
-  ctx->dstMesh = ctx->srcMesh;
+  ctx->dstMesh.ndims = 2;
+  ctx->dstMesh.dims = ctx->meshDims;
   ctx->dstMesh.startRank = 1;
-  ctx->srcA = makeReducedBucketTensor(ctx->inA && ctx->rankA == 0 ? ctx->bufferA : nullptr, &ctx->srcMesh);
-  ctx->dstA = makeReducedBucketTensor(ctx->inA && ctx->rankA == 1 ? ctx->bufferA : nullptr, &ctx->dstMesh);
-  ctx->srcB = makeReducedBucketTensor(ctx->inB && ctx->rankB == 0 ? ctx->bufferB : nullptr, &ctx->srcMesh);
-  ctx->dstB = makeReducedBucketTensor(ctx->inB && ctx->rankB == 1 ? ctx->bufferB : nullptr, &ctx->dstMesh);
+  ctx->srcA = makeReducedBucketTensor(ctx->inA && ctx->rankA == 0 ? ctx->bufferA : nullptr, &ctx->srcMesh,
+                                      ctx->localShape, ctx->placements);
+  ctx->dstA = makeReducedBucketTensor(ctx->inA && ctx->rankA == 1 ? ctx->bufferA : nullptr, &ctx->dstMesh,
+                                      ctx->localShape, ctx->placements);
+  ctx->srcB = makeReducedBucketTensor(ctx->inB && ctx->rankB == 0 ? ctx->bufferB : nullptr, &ctx->srcMesh,
+                                      ctx->localShape, ctx->placements);
+  ctx->dstB = makeReducedBucketTensor(ctx->inB && ctx->rankB == 1 ? ctx->bufferB : nullptr, &ctx->dstMesh,
+                                      ctx->localShape, ctx->placements);
 }
 
 static void expectReducedBucketPattern(void* buffer, unsigned char expected) {
