@@ -15,6 +15,7 @@
  ************************************************************************/
 
 #include <gtest/gtest.h>
+#include <gtest/gtest-param-test.h>
 
 #include <algorithm>
 #include <array>
