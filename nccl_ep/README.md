@@ -323,6 +323,41 @@ export NCCL_EP_TOKENS_PER_CHUNK=128
 export NCCL_EP_ENV_VERBOSE=true
 ```
 
+HT dispatch and combine automatically adjust their pipeline configuration to
+fit the device shared-memory (SMEM) limit. The following variables override the
+pipeline defaults:
+
+```bash
+# Optional dispatch overrides with defaults
+export NCCL_EP_DISPATCH_NUM_STAGES=12
+export NCCL_EP_DISPATCH_NUM_PIPELINES=2
+
+# Optional combine overrides with defaults
+export NCCL_EP_COMBINE_NUM_STAGES_G2S=12  # 4 with multiple LSA teams
+export NCCL_EP_COMBINE_NUM_STAGES_S2G=2
+export NCCL_EP_COMBINE_NUM_PIPELINES=2    # 1 with multiple LSA teams
+```
+
+More stages or pipelines can improve overlap but consume more SMEM. Explicit
+overrides are not reduced by the automatic tuner, and the operation returns
+`ncclInvalidArgument` if the requested configuration cannot fit. When unset, the
+tuner selects stage and pipeline counts that fit while preserving as much
+overlap as possible. Leave these variables unset unless tuning a representative
+workload. With `NCCL_EP_ENV_VERBOSE=true`, NCCL EP also prints the requested and
+selected pipeline configuration, SMEM usage, and device limit when an HT kernel
+configuration is first used.
+
+HT SM-count controls:
+
+```bash
+# Dispatch and combine default
+export NCCL_EP_COMM_SMS=16
+
+# Shuffle and preprocessing default to all device SMs
+export NCCL_EP_SHUFFLE_SMS=<number_of_sms>
+export NCCL_EP_PREPROCESS_NUM_SMS=<number_of_sms>
+```
+
 By default EP guards its internal communication buffers so that neighboring
 dispatch/combine calls cannot corrupt each other's data; this is safe and needs
 no configuration. Advanced callers that can already guarantee consecutive EP
