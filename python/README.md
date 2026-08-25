@@ -56,9 +56,7 @@ pip install -e 'python/[cu13]'
 > there, so that directory resolves only as a namespace portion and these
 > modules become invisible. Always go through the editable install.
 
-## Regenerating the bindings
+## Generated bindings
 
 Everything under `nccl/_extensions/bindings/` is generated and checked in. Do
-not edit it by hand — re-run
-[`build_assets/generate_cython.py`](build_assets/README.md) after changing a
-public header, config, or template and commit the result.
+not edit it by hand. Public builds use these checked-in sources directly.

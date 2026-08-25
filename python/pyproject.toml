@@ -33,7 +33,9 @@ cu12 = ["nccl4py[cu12]"]
 cu13 = ["nccl4py[cu13]"]
 
 [project.urls]
-Homepage = "https://gitlab-master.nvidia.com/nccl/nccl-extensions"
+homepage = "https://github.com/NVIDIA/nccl-extensions"
+repository = "https://github.com/NVIDIA/nccl-extensions"
+issues = "https://github.com/NVIDIA/nccl-extensions/issues"
 
 [tool.setuptools.dynamic]
 version = { attr = "nccl._extensions._version.__version__" }
