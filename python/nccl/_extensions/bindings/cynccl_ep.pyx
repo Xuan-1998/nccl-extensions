@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# This code was automatically generated with version 0.1.0. Do not modify it directly.
+# This code was automatically generated with version 0.2.0. Do not modify it directly.
 
 from ._internal cimport nccl_ep as _nccl_ep
 
@@ -61,3 +61,23 @@ cdef ncclResult_t ncclEpCombine(ncclEpHandle_t handle, const ncclEpCombineInputs
 
 cdef ncclResult_t ncclEpComplete(ncclEpHandle_t handle, const ncclEpCompleteConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
     return _nccl_ep._ncclEpComplete(handle, config, stream)
+
+
+cdef ncclResult_t ncclEpMaskQuery(ncclEpGroup_t ep_group, int* mask_status, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpMaskQuery(ep_group, mask_status, stream)
+
+
+cdef ncclResult_t ncclEpMaskUpdate(ncclEpGroup_t ep_group, const int* mask, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpMaskUpdate(ep_group, mask, stream)
+
+
+cdef ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpMaskClean(ep_group, stream)
+
+
+cdef ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpGetAsyncError(ep_group, error_out)
+
+
+cdef ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpErrorClear(ep_group)

@@ -2,55 +2,30 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# This code was automatically generated with version 0.1.0. Do not modify it directly.
-
-cimport cython  # NOQA
-from libc.stdint cimport uint64_t
-from libcpp.vector cimport vector
-
-from ._internal.utils cimport (nested_resource, nullable_unique_ptr, get_buffer_pointer,
-                              get_resource_ptr, get_nested_resource_ptr)
-
-from enum import IntEnum as _IntEnum
+# This code was automatically generated with version 0.2.0. Do not modify it directly.
 
 
-from libc.stdlib cimport calloc, free, malloc
-from cython cimport view
-cimport cpython.buffer
-cimport cpython.memoryview
-cimport cpython
-from libc.string cimport memcmp, memcpy
+# <<<< PREAMBLE CONTENT >>>>
+
+cimport cpython as _cyb_cpython
+cimport cpython.buffer as _cyb_cpython_buffer
+from cython cimport view as _cyb_view
+from libc.stdint cimport intptr_t
+from libc.stdlib cimport (
+    calloc as _cyb_calloc,
+    free as _cyb_free,
+    malloc as _cyb_malloc,
+)
+from libc.string cimport (
+    memcmp as _cyb_memcmp,
+    memcpy as _cyb_memcpy,
+)
+
+from enum import IntEnum as _cyb_IntEnum
+
 import numpy as _numpy
 
-
-cdef __from_data(data, dtype_name, expected_dtype, lowpp_type):
-    # _numpy.recarray is a subclass of _numpy.ndarray, so implicitly handled here.
-    if isinstance(data, lowpp_type):
-        return data
-    if not isinstance(data, _numpy.ndarray):
-        raise TypeError("data argument must be a NumPy ndarray")
-    if data.size != 1:
-        raise ValueError("data array must have a size of 1")
-    if data.dtype != expected_dtype:
-        raise ValueError(f"data array must be of dtype {dtype_name}")
-    return lowpp_type.from_ptr(data.ctypes.data, not data.flags.writeable, data)
-
-
-cdef __from_buffer(buffer, size, lowpp_type):
-    cdef Py_buffer view
-    if cpython.PyObject_GetBuffer(buffer, &view, cpython.PyBUF_SIMPLE) != 0:
-        raise TypeError("buffer argument does not support the buffer protocol")
-    try:
-        if view.itemsize != 1:
-            raise ValueError("buffer itemsize must be 1 byte")
-        if view.len != size:
-            raise ValueError(f"buffer length must be {size} bytes")
-        return lowpp_type.from_ptr(<intptr_t><void *>view.buf, not view.readonly, buffer)
-    finally:
-        cpython.PyBuffer_Release(&view)
-
-
-cdef __getbuffer(object self, cpython.Py_buffer *buffer, void *ptr, int size, bint readonly):
+cdef _cyb___getbuffer(object self, _cyb_cpython.Py_buffer *buffer, void *ptr, int size, bint readonly):
     buffer.buf = <char *>ptr
     buffer.format = 'b'
     buffer.internal = NULL
@@ -63,13 +38,56 @@ cdef __getbuffer(object self, cpython.Py_buffer *buffer, void *ptr, int size, bi
     buffer.strides = &buffer.itemsize
     buffer.suboffsets = NULL
 
+cdef _cyb_from_buffer(buffer, size, lowpp_type):
+    cdef _cyb_cpython.Py_buffer view
+    if _cyb_cpython.PyObject_GetBuffer(buffer, &view, _cyb_cpython_buffer.PyBUF_SIMPLE) != 0:
+        raise TypeError("buffer argument does not support the buffer protocol")
+    try:
+        if view.itemsize != 1:
+            raise ValueError("buffer itemsize must be 1 byte")
+        if view.len != size:
+            raise ValueError(f"buffer length must be {size} bytes")
+        return lowpp_type.from_ptr(<intptr_t><void *>view.buf, not view.readonly, buffer)
+    finally:
+        _cyb_cpython.PyBuffer_Release(&view)
+
+cdef _cyb_from_data(data, dtype_name, expected_dtype, lowpp_type):
+    # _numpy.recarray is a subclass of _numpy.ndarray, so implicitly handled here.
+    if isinstance(data, lowpp_type):
+        return data
+    if not isinstance(data, _numpy.ndarray):
+        raise TypeError("data argument must be a NumPy ndarray")
+    if data.size != 1:
+        raise ValueError("data array must have a size of 1")
+    if data.dtype != expected_dtype:
+        raise ValueError(f"data array must be of dtype {dtype_name}")
+    return lowpp_type.from_ptr(data.ctypes.data, not data.flags.writeable, data)
+
+
+# <<<< END OF PREAMBLE CONTENT >>>>
+
+cimport cython  # NOQA
+from libcpp.vector cimport vector
+
+from ._internal.utils cimport (nested_resource, nullable_unique_ptr,
+                              get_resource_ptr, get_nested_resource_ptr)
+
+_version_span = "with version 0.2.0"
+__version__ = _version_span.split()[-1]
+
+# NCCL_VERSION(X,Y,Z) = X*10000 + Y*100 + Z (NCCL >= 2.9).
+_version_parts = __version__.split(".")
+__version_code__ = (
+    int(_version_parts[0]) * 10000 + int(_version_parts[1]) * 100 + int(_version_parts[2])
+)
+
 
 ###############################################################################
 # POD
 ###############################################################################
 
 cdef _get_tensor_dtype_offsets():
-    cdef ncclEpTensor_t pod = ncclEpTensor_t()
+    cdef ncclEpTensor_t pod
     return _numpy.dtype({
         'names': ['size_', 'magic', 'ndim_', 'datatype', 'data_', 'win_hdl', 'win_offset', 'sizes'],
         'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(ncclDataType_t))), _numpy.intp, _numpy.intp, _numpy.uint64, _numpy.intp],
@@ -101,7 +119,7 @@ cdef class Tensor:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpTensor_t *>calloc(1, sizeof(ncclEpTensor_t))
+        self._ptr = <ncclEpTensor_t *>_cyb_calloc(1, sizeof(ncclEpTensor_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating Tensor")
         self._owner = None
@@ -116,7 +134,7 @@ cdef class Tensor:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.Tensor object at {hex(id(self))}>"
@@ -137,20 +155,20 @@ cdef class Tensor:
         if not isinstance(other, Tensor):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpTensor_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpTensor_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpTensor_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpTensor_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpTensor_t *>malloc(sizeof(ncclEpTensor_t))
+            self._ptr = <ncclEpTensor_t *>_cyb_malloc(sizeof(ncclEpTensor_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating Tensor")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpTensor_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpTensor_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -248,7 +266,7 @@ cdef class Tensor:
     @staticmethod
     def from_buffer(buffer):
         """Create an Tensor instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpTensor_t), Tensor)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpTensor_t), Tensor)
 
     @staticmethod
     def from_data(data):
@@ -257,7 +275,7 @@ cdef class Tensor:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `tensor_dtype` holding the data.
         """
-        return __from_data(data, "tensor_dtype", tensor_dtype, Tensor)
+        return _cyb_from_data(data, "tensor_dtype", tensor_dtype, Tensor)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -272,10 +290,10 @@ cdef class Tensor:
             raise ValueError("ptr must not be null (0)")
         cdef Tensor obj = Tensor.__new__(Tensor)
         if owner is None:
-            obj._ptr = <ncclEpTensor_t *>malloc(sizeof(ncclEpTensor_t))
+            obj._ptr = <ncclEpTensor_t *>_cyb_malloc(sizeof(ncclEpTensor_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating Tensor")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpTensor_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpTensor_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -287,7 +305,7 @@ cdef class Tensor:
 
 
 cdef _get_tensor_alloc_config_dtype_offsets():
-    cdef ncclEpTensorAllocConfig_t pod = ncclEpTensorAllocConfig_t()
+    cdef ncclEpTensorAllocConfig_t pod
     return _numpy.dtype({
         'names': ['size_', 'magic'],
         'formats': [_numpy.uint32, _numpy.uint32],
@@ -313,7 +331,7 @@ cdef class TensorAllocConfig:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpTensorAllocConfig_t *>calloc(1, sizeof(ncclEpTensorAllocConfig_t))
+        self._ptr = <ncclEpTensorAllocConfig_t *>_cyb_calloc(1, sizeof(ncclEpTensorAllocConfig_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating TensorAllocConfig")
         self._owner = None
@@ -328,7 +346,7 @@ cdef class TensorAllocConfig:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.TensorAllocConfig object at {hex(id(self))}>"
@@ -349,20 +367,20 @@ cdef class TensorAllocConfig:
         if not isinstance(other, TensorAllocConfig):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpTensorAllocConfig_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpTensorAllocConfig_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpTensorAllocConfig_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpTensorAllocConfig_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpTensorAllocConfig_t *>malloc(sizeof(ncclEpTensorAllocConfig_t))
+            self._ptr = <ncclEpTensorAllocConfig_t *>_cyb_malloc(sizeof(ncclEpTensorAllocConfig_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating TensorAllocConfig")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpTensorAllocConfig_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpTensorAllocConfig_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -394,7 +412,7 @@ cdef class TensorAllocConfig:
     @staticmethod
     def from_buffer(buffer):
         """Create an TensorAllocConfig instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpTensorAllocConfig_t), TensorAllocConfig)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpTensorAllocConfig_t), TensorAllocConfig)
 
     @staticmethod
     def from_data(data):
@@ -403,7 +421,7 @@ cdef class TensorAllocConfig:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `tensor_alloc_config_dtype` holding the data.
         """
-        return __from_data(data, "tensor_alloc_config_dtype", tensor_alloc_config_dtype, TensorAllocConfig)
+        return _cyb_from_data(data, "tensor_alloc_config_dtype", tensor_alloc_config_dtype, TensorAllocConfig)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -418,10 +436,10 @@ cdef class TensorAllocConfig:
             raise ValueError("ptr must not be null (0)")
         cdef TensorAllocConfig obj = TensorAllocConfig.__new__(TensorAllocConfig)
         if owner is None:
-            obj._ptr = <ncclEpTensorAllocConfig_t *>malloc(sizeof(ncclEpTensorAllocConfig_t))
+            obj._ptr = <ncclEpTensorAllocConfig_t *>_cyb_malloc(sizeof(ncclEpTensorAllocConfig_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating TensorAllocConfig")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpTensorAllocConfig_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpTensorAllocConfig_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -433,7 +451,7 @@ cdef class TensorAllocConfig:
 
 
 cdef _get_alloc_config_dtype_offsets():
-    cdef ncclEpAllocConfig_t pod = ncclEpAllocConfig_t()
+    cdef ncclEpAllocConfig_t pod
     return _numpy.dtype({
         'names': ['alloc_fn', 'free_fn', 'context'],
         'formats': [_numpy.dtype(('V', sizeof(ncclEpAllocFn_t))), _numpy.dtype(('V', sizeof(ncclEpFreeFn_t))), _numpy.intp],
@@ -460,7 +478,7 @@ cdef class AllocConfig:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpAllocConfig_t *>calloc(1, sizeof(ncclEpAllocConfig_t))
+        self._ptr = <ncclEpAllocConfig_t *>_cyb_calloc(1, sizeof(ncclEpAllocConfig_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating AllocConfig")
         self._owner = None
@@ -472,7 +490,7 @@ cdef class AllocConfig:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.AllocConfig object at {hex(id(self))}>"
@@ -493,20 +511,20 @@ cdef class AllocConfig:
         if not isinstance(other, AllocConfig):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpAllocConfig_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpAllocConfig_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpAllocConfig_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpAllocConfig_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpAllocConfig_t *>malloc(sizeof(ncclEpAllocConfig_t))
+            self._ptr = <ncclEpAllocConfig_t *>_cyb_malloc(sizeof(ncclEpAllocConfig_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating AllocConfig")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpAllocConfig_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpAllocConfig_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -547,7 +565,7 @@ cdef class AllocConfig:
     @staticmethod
     def from_buffer(buffer):
         """Create an AllocConfig instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpAllocConfig_t), AllocConfig)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpAllocConfig_t), AllocConfig)
 
     @staticmethod
     def from_data(data):
@@ -556,7 +574,7 @@ cdef class AllocConfig:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `alloc_config_dtype` holding the data.
         """
-        return __from_data(data, "alloc_config_dtype", alloc_config_dtype, AllocConfig)
+        return _cyb_from_data(data, "alloc_config_dtype", alloc_config_dtype, AllocConfig)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -571,10 +589,10 @@ cdef class AllocConfig:
             raise ValueError("ptr must not be null (0)")
         cdef AllocConfig obj = AllocConfig.__new__(AllocConfig)
         if owner is None:
-            obj._ptr = <ncclEpAllocConfig_t *>malloc(sizeof(ncclEpAllocConfig_t))
+            obj._ptr = <ncclEpAllocConfig_t *>_cyb_malloc(sizeof(ncclEpAllocConfig_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating AllocConfig")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpAllocConfig_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpAllocConfig_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -586,7 +604,7 @@ cdef class AllocConfig:
 
 
 cdef _get_handle_config_dtype_offsets():
-    cdef ncclEpHandleConfig_t pod = ncclEpHandleConfig_t()
+    cdef ncclEpHandleConfig_t pod
     return _numpy.dtype({
         'names': ['size_', 'magic', 'dispatch_output_per_expert_alignment'],
         'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint64],
@@ -613,7 +631,7 @@ cdef class HandleConfig:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpHandleConfig_t *>calloc(1, sizeof(ncclEpHandleConfig_t))
+        self._ptr = <ncclEpHandleConfig_t *>_cyb_calloc(1, sizeof(ncclEpHandleConfig_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating HandleConfig")
         self._owner = None
@@ -628,7 +646,7 @@ cdef class HandleConfig:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.HandleConfig object at {hex(id(self))}>"
@@ -649,20 +667,20 @@ cdef class HandleConfig:
         if not isinstance(other, HandleConfig):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpHandleConfig_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpHandleConfig_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpHandleConfig_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpHandleConfig_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpHandleConfig_t *>malloc(sizeof(ncclEpHandleConfig_t))
+            self._ptr = <ncclEpHandleConfig_t *>_cyb_malloc(sizeof(ncclEpHandleConfig_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating HandleConfig")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpHandleConfig_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpHandleConfig_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -705,7 +723,7 @@ cdef class HandleConfig:
     @staticmethod
     def from_buffer(buffer):
         """Create an HandleConfig instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpHandleConfig_t), HandleConfig)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpHandleConfig_t), HandleConfig)
 
     @staticmethod
     def from_data(data):
@@ -714,7 +732,7 @@ cdef class HandleConfig:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `handle_config_dtype` holding the data.
         """
-        return __from_data(data, "handle_config_dtype", handle_config_dtype, HandleConfig)
+        return _cyb_from_data(data, "handle_config_dtype", handle_config_dtype, HandleConfig)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -729,10 +747,10 @@ cdef class HandleConfig:
             raise ValueError("ptr must not be null (0)")
         cdef HandleConfig obj = HandleConfig.__new__(HandleConfig)
         if owner is None:
-            obj._ptr = <ncclEpHandleConfig_t *>malloc(sizeof(ncclEpHandleConfig_t))
+            obj._ptr = <ncclEpHandleConfig_t *>_cyb_malloc(sizeof(ncclEpHandleConfig_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating HandleConfig")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpHandleConfig_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpHandleConfig_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -744,9 +762,9 @@ cdef class HandleConfig:
 
 
 cdef _get_dispatch_config_dtype_offsets():
-    cdef ncclEpDispatchConfig_t pod = ncclEpDispatchConfig_t()
+    cdef ncclEpDispatchConfig_t pod
     return _numpy.dtype({
-        'names': ['size_', 'magic', 'send_only', 'round_scales', 'pass_direction', 'quantization_recipe'],
+        'names': ['size_', 'magic', 'send_only', 'round_scales', 'pass_direction', 'quant_recipe'],
         'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.int32],
         'offsets': [
             (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
@@ -754,7 +772,7 @@ cdef _get_dispatch_config_dtype_offsets():
             (<intptr_t>&(pod.send_only)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.round_scales)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.pass_direction)) - (<intptr_t>&pod),
-            (<intptr_t>&(pod.quantization_recipe)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.quant_recipe)) - (<intptr_t>&pod),
         ],
         'itemsize': sizeof(ncclEpDispatchConfig_t),
     })
@@ -774,7 +792,7 @@ cdef class DispatchConfig:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpDispatchConfig_t *>calloc(1, sizeof(ncclEpDispatchConfig_t))
+        self._ptr = <ncclEpDispatchConfig_t *>_cyb_calloc(1, sizeof(ncclEpDispatchConfig_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating DispatchConfig")
         self._owner = None
@@ -789,7 +807,7 @@ cdef class DispatchConfig:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.DispatchConfig object at {hex(id(self))}>"
@@ -810,20 +828,20 @@ cdef class DispatchConfig:
         if not isinstance(other, DispatchConfig):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpDispatchConfig_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpDispatchConfig_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpDispatchConfig_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpDispatchConfig_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpDispatchConfig_t *>malloc(sizeof(ncclEpDispatchConfig_t))
+            self._ptr = <ncclEpDispatchConfig_t *>_cyb_malloc(sizeof(ncclEpDispatchConfig_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating DispatchConfig")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpDispatchConfig_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpDispatchConfig_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -886,20 +904,20 @@ cdef class DispatchConfig:
         self._ptr[0].pass_direction = <ncclEpPassDir_t><int>val
 
     @property
-    def quantization_recipe(self):
+    def quant_recipe(self):
         """int: """
-        return <int>(self._ptr[0].quantization_recipe)
+        return <int>(self._ptr[0].quant_recipe)
 
-    @quantization_recipe.setter
-    def quantization_recipe(self, val):
+    @quant_recipe.setter
+    def quant_recipe(self, val):
         if self._readonly:
             raise ValueError("This DispatchConfig instance is read-only")
-        self._ptr[0].quantization_recipe = <ncclEpDispatchQuantizationRecipe_t><int>val
+        self._ptr[0].quant_recipe = <ncclEpDispQuant_t><int>val
 
     @staticmethod
     def from_buffer(buffer):
         """Create an DispatchConfig instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpDispatchConfig_t), DispatchConfig)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpDispatchConfig_t), DispatchConfig)
 
     @staticmethod
     def from_data(data):
@@ -908,7 +926,7 @@ cdef class DispatchConfig:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `dispatch_config_dtype` holding the data.
         """
-        return __from_data(data, "dispatch_config_dtype", dispatch_config_dtype, DispatchConfig)
+        return _cyb_from_data(data, "dispatch_config_dtype", dispatch_config_dtype, DispatchConfig)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -923,10 +941,10 @@ cdef class DispatchConfig:
             raise ValueError("ptr must not be null (0)")
         cdef DispatchConfig obj = DispatchConfig.__new__(DispatchConfig)
         if owner is None:
-            obj._ptr = <ncclEpDispatchConfig_t *>malloc(sizeof(ncclEpDispatchConfig_t))
+            obj._ptr = <ncclEpDispatchConfig_t *>_cyb_malloc(sizeof(ncclEpDispatchConfig_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating DispatchConfig")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpDispatchConfig_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpDispatchConfig_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -938,16 +956,16 @@ cdef class DispatchConfig:
 
 
 cdef _get_combine_config_dtype_offsets():
-    cdef ncclEpCombineConfig_t pod = ncclEpCombineConfig_t()
+    cdef ncclEpCombineConfig_t pod
     return _numpy.dtype({
-        'names': ['size_', 'magic', 'send_only', 'pass_direction', 'quantization_recipe'],
+        'names': ['size_', 'magic', 'send_only', 'pass_direction', 'quant_recipe'],
         'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.int32],
         'offsets': [
             (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.magic)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.send_only)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.pass_direction)) - (<intptr_t>&pod),
-            (<intptr_t>&(pod.quantization_recipe)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.quant_recipe)) - (<intptr_t>&pod),
         ],
         'itemsize': sizeof(ncclEpCombineConfig_t),
     })
@@ -967,7 +985,7 @@ cdef class CombineConfig:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpCombineConfig_t *>calloc(1, sizeof(ncclEpCombineConfig_t))
+        self._ptr = <ncclEpCombineConfig_t *>_cyb_calloc(1, sizeof(ncclEpCombineConfig_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating CombineConfig")
         self._owner = None
@@ -982,7 +1000,7 @@ cdef class CombineConfig:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.CombineConfig object at {hex(id(self))}>"
@@ -1003,20 +1021,20 @@ cdef class CombineConfig:
         if not isinstance(other, CombineConfig):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpCombineConfig_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpCombineConfig_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpCombineConfig_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpCombineConfig_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpCombineConfig_t *>malloc(sizeof(ncclEpCombineConfig_t))
+            self._ptr = <ncclEpCombineConfig_t *>_cyb_malloc(sizeof(ncclEpCombineConfig_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating CombineConfig")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpCombineConfig_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpCombineConfig_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -1068,20 +1086,20 @@ cdef class CombineConfig:
         self._ptr[0].pass_direction = <ncclEpPassDir_t><int>val
 
     @property
-    def quantization_recipe(self):
+    def quant_recipe(self):
         """int: """
-        return <int>(self._ptr[0].quantization_recipe)
+        return <int>(self._ptr[0].quant_recipe)
 
-    @quantization_recipe.setter
-    def quantization_recipe(self, val):
+    @quant_recipe.setter
+    def quant_recipe(self, val):
         if self._readonly:
             raise ValueError("This CombineConfig instance is read-only")
-        self._ptr[0].quantization_recipe = <ncclEpCombineQuantizationRecipe_t><int>val
+        self._ptr[0].quant_recipe = <ncclEpCombQuant_t><int>val
 
     @staticmethod
     def from_buffer(buffer):
         """Create an CombineConfig instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpCombineConfig_t), CombineConfig)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpCombineConfig_t), CombineConfig)
 
     @staticmethod
     def from_data(data):
@@ -1090,7 +1108,7 @@ cdef class CombineConfig:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `combine_config_dtype` holding the data.
         """
-        return __from_data(data, "combine_config_dtype", combine_config_dtype, CombineConfig)
+        return _cyb_from_data(data, "combine_config_dtype", combine_config_dtype, CombineConfig)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -1105,10 +1123,10 @@ cdef class CombineConfig:
             raise ValueError("ptr must not be null (0)")
         cdef CombineConfig obj = CombineConfig.__new__(CombineConfig)
         if owner is None:
-            obj._ptr = <ncclEpCombineConfig_t *>malloc(sizeof(ncclEpCombineConfig_t))
+            obj._ptr = <ncclEpCombineConfig_t *>_cyb_malloc(sizeof(ncclEpCombineConfig_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating CombineConfig")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpCombineConfig_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpCombineConfig_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -1120,7 +1138,7 @@ cdef class CombineConfig:
 
 
 cdef _get_complete_config_dtype_offsets():
-    cdef ncclEpCompleteConfig_t pod = ncclEpCompleteConfig_t()
+    cdef ncclEpCompleteConfig_t pod
     return _numpy.dtype({
         'names': ['size_', 'magic'],
         'formats': [_numpy.uint32, _numpy.uint32],
@@ -1146,7 +1164,7 @@ cdef class CompleteConfig:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpCompleteConfig_t *>calloc(1, sizeof(ncclEpCompleteConfig_t))
+        self._ptr = <ncclEpCompleteConfig_t *>_cyb_calloc(1, sizeof(ncclEpCompleteConfig_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating CompleteConfig")
         self._owner = None
@@ -1161,7 +1179,7 @@ cdef class CompleteConfig:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.CompleteConfig object at {hex(id(self))}>"
@@ -1182,20 +1200,20 @@ cdef class CompleteConfig:
         if not isinstance(other, CompleteConfig):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpCompleteConfig_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpCompleteConfig_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpCompleteConfig_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpCompleteConfig_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpCompleteConfig_t *>malloc(sizeof(ncclEpCompleteConfig_t))
+            self._ptr = <ncclEpCompleteConfig_t *>_cyb_malloc(sizeof(ncclEpCompleteConfig_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating CompleteConfig")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpCompleteConfig_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpCompleteConfig_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -1227,7 +1245,7 @@ cdef class CompleteConfig:
     @staticmethod
     def from_buffer(buffer):
         """Create an CompleteConfig instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpCompleteConfig_t), CompleteConfig)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpCompleteConfig_t), CompleteConfig)
 
     @staticmethod
     def from_data(data):
@@ -1236,7 +1254,7 @@ cdef class CompleteConfig:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `complete_config_dtype` holding the data.
         """
-        return __from_data(data, "complete_config_dtype", complete_config_dtype, CompleteConfig)
+        return _cyb_from_data(data, "complete_config_dtype", complete_config_dtype, CompleteConfig)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -1251,10 +1269,10 @@ cdef class CompleteConfig:
             raise ValueError("ptr must not be null (0)")
         cdef CompleteConfig obj = CompleteConfig.__new__(CompleteConfig)
         if owner is None:
-            obj._ptr = <ncclEpCompleteConfig_t *>malloc(sizeof(ncclEpCompleteConfig_t))
+            obj._ptr = <ncclEpCompleteConfig_t *>_cyb_malloc(sizeof(ncclEpCompleteConfig_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating CompleteConfig")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpCompleteConfig_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpCompleteConfig_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -1266,10 +1284,10 @@ cdef class CompleteConfig:
 
 
 cdef _get_layout_info_dtype_offsets():
-    cdef ncclEpLayoutInfo_t pod = ncclEpLayoutInfo_t()
+    cdef ncclEpLayoutInfo_t pod
     return _numpy.dtype({
-        'names': ['size_', 'magic', 'expert_counters', 'src_rank_counters', 'expert_offsets', 'recv_total_counter', 'recv_topk_idx_kind'],
-        'formats': [_numpy.uint32, _numpy.uint32, _numpy.intp, _numpy.intp, _numpy.intp, _numpy.intp, _numpy.int32],
+        'names': ['size_', 'magic', 'expert_counters', 'src_rank_counters', 'expert_offsets', 'recv_total_counter', 'recv_topk_idx_kind', 'padding_v2'],
+        'formats': [_numpy.uint32, _numpy.uint32, _numpy.intp, _numpy.intp, _numpy.intp, _numpy.intp, _numpy.int32, (_numpy.uint8, 4)],
         'offsets': [
             (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.magic)) - (<intptr_t>&pod),
@@ -1278,6 +1296,7 @@ cdef _get_layout_info_dtype_offsets():
             (<intptr_t>&(pod.expert_offsets)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.recv_total_counter)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.recv_topk_idx_kind)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.padding_v2)) - (<intptr_t>&pod),
         ],
         'itemsize': sizeof(ncclEpLayoutInfo_t),
     })
@@ -1297,7 +1316,7 @@ cdef class LayoutInfo:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpLayoutInfo_t *>calloc(1, sizeof(ncclEpLayoutInfo_t))
+        self._ptr = <ncclEpLayoutInfo_t *>_cyb_calloc(1, sizeof(ncclEpLayoutInfo_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating LayoutInfo")
         self._owner = None
@@ -1312,7 +1331,7 @@ cdef class LayoutInfo:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.LayoutInfo object at {hex(id(self))}>"
@@ -1333,20 +1352,20 @@ cdef class LayoutInfo:
         if not isinstance(other, LayoutInfo):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpLayoutInfo_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpLayoutInfo_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpLayoutInfo_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpLayoutInfo_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpLayoutInfo_t *>malloc(sizeof(ncclEpLayoutInfo_t))
+            self._ptr = <ncclEpLayoutInfo_t *>_cyb_malloc(sizeof(ncclEpLayoutInfo_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating LayoutInfo")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpLayoutInfo_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpLayoutInfo_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -1430,10 +1449,27 @@ cdef class LayoutInfo:
             raise ValueError("This LayoutInfo instance is read-only")
         self._ptr[0].recv_topk_idx_kind = <ncclEpExpertIdKind_t><int>val
 
+    @property
+    def padding_v2(self):
+        """~_numpy.uint8: (array of length 4)."""
+        cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c", allocate_buffer=False)
+        arr.data = <char *>(&(self._ptr[0].padding_v2))
+        return _numpy.asarray(arr)
+
+    @padding_v2.setter
+    def padding_v2(self, val):
+        if self._readonly:
+            raise ValueError("This LayoutInfo instance is read-only")
+        if len(val) != 4:
+            raise ValueError(f"Expected length { 4 } for field padding_v2, got {len(val)}")
+        cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c")
+        arr[:] = _numpy.asarray(val, dtype=_numpy.uint8)
+        _cyb_memcpy(<void *>(&(self._ptr[0].padding_v2)), <void *>(arr.data), sizeof(unsigned char) * len(val))
+
     @staticmethod
     def from_buffer(buffer):
         """Create an LayoutInfo instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpLayoutInfo_t), LayoutInfo)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpLayoutInfo_t), LayoutInfo)
 
     @staticmethod
     def from_data(data):
@@ -1442,7 +1478,7 @@ cdef class LayoutInfo:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `layout_info_dtype` holding the data.
         """
-        return __from_data(data, "layout_info_dtype", layout_info_dtype, LayoutInfo)
+        return _cyb_from_data(data, "layout_info_dtype", layout_info_dtype, LayoutInfo)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -1457,10 +1493,10 @@ cdef class LayoutInfo:
             raise ValueError("ptr must not be null (0)")
         cdef LayoutInfo obj = LayoutInfo.__new__(LayoutInfo)
         if owner is None:
-            obj._ptr = <ncclEpLayoutInfo_t *>malloc(sizeof(ncclEpLayoutInfo_t))
+            obj._ptr = <ncclEpLayoutInfo_t *>_cyb_malloc(sizeof(ncclEpLayoutInfo_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating LayoutInfo")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpLayoutInfo_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpLayoutInfo_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -1472,7 +1508,7 @@ cdef class LayoutInfo:
 
 
 cdef _get_dispatch_inputs_dtype_offsets():
-    cdef ncclEpDispatchInputs_t pod = ncclEpDispatchInputs_t()
+    cdef ncclEpDispatchInputs_t pod
     return _numpy.dtype({
         'names': ['size_', 'magic', 'tokens', 'topk_weights', 'scales'],
         'formats': [_numpy.uint32, _numpy.uint32, _numpy.intp, _numpy.intp, _numpy.intp],
@@ -1501,7 +1537,7 @@ cdef class DispatchInputs:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpDispatchInputs_t *>calloc(1, sizeof(ncclEpDispatchInputs_t))
+        self._ptr = <ncclEpDispatchInputs_t *>_cyb_calloc(1, sizeof(ncclEpDispatchInputs_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating DispatchInputs")
         self._owner = None
@@ -1516,7 +1552,7 @@ cdef class DispatchInputs:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.DispatchInputs object at {hex(id(self))}>"
@@ -1537,20 +1573,20 @@ cdef class DispatchInputs:
         if not isinstance(other, DispatchInputs):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpDispatchInputs_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpDispatchInputs_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpDispatchInputs_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpDispatchInputs_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpDispatchInputs_t *>malloc(sizeof(ncclEpDispatchInputs_t))
+            self._ptr = <ncclEpDispatchInputs_t *>_cyb_malloc(sizeof(ncclEpDispatchInputs_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating DispatchInputs")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpDispatchInputs_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpDispatchInputs_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -1615,7 +1651,7 @@ cdef class DispatchInputs:
     @staticmethod
     def from_buffer(buffer):
         """Create an DispatchInputs instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpDispatchInputs_t), DispatchInputs)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpDispatchInputs_t), DispatchInputs)
 
     @staticmethod
     def from_data(data):
@@ -1624,7 +1660,7 @@ cdef class DispatchInputs:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `dispatch_inputs_dtype` holding the data.
         """
-        return __from_data(data, "dispatch_inputs_dtype", dispatch_inputs_dtype, DispatchInputs)
+        return _cyb_from_data(data, "dispatch_inputs_dtype", dispatch_inputs_dtype, DispatchInputs)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -1639,10 +1675,10 @@ cdef class DispatchInputs:
             raise ValueError("ptr must not be null (0)")
         cdef DispatchInputs obj = DispatchInputs.__new__(DispatchInputs)
         if owner is None:
-            obj._ptr = <ncclEpDispatchInputs_t *>malloc(sizeof(ncclEpDispatchInputs_t))
+            obj._ptr = <ncclEpDispatchInputs_t *>_cyb_malloc(sizeof(ncclEpDispatchInputs_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating DispatchInputs")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpDispatchInputs_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpDispatchInputs_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -1654,7 +1690,7 @@ cdef class DispatchInputs:
 
 
 cdef _get_dispatch_outputs_dtype_offsets():
-    cdef ncclEpDispatchOutputs_t pod = ncclEpDispatchOutputs_t()
+    cdef ncclEpDispatchOutputs_t pod
     return _numpy.dtype({
         'names': ['size_', 'magic', 'tokens', 'topk_weights', 'scales', 'topk_idx'],
         'formats': [_numpy.uint32, _numpy.uint32, _numpy.intp, _numpy.intp, _numpy.intp, _numpy.intp],
@@ -1684,7 +1720,7 @@ cdef class DispatchOutputs:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpDispatchOutputs_t *>calloc(1, sizeof(ncclEpDispatchOutputs_t))
+        self._ptr = <ncclEpDispatchOutputs_t *>_cyb_calloc(1, sizeof(ncclEpDispatchOutputs_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating DispatchOutputs")
         self._owner = None
@@ -1699,7 +1735,7 @@ cdef class DispatchOutputs:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.DispatchOutputs object at {hex(id(self))}>"
@@ -1720,20 +1756,20 @@ cdef class DispatchOutputs:
         if not isinstance(other, DispatchOutputs):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpDispatchOutputs_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpDispatchOutputs_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpDispatchOutputs_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpDispatchOutputs_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpDispatchOutputs_t *>malloc(sizeof(ncclEpDispatchOutputs_t))
+            self._ptr = <ncclEpDispatchOutputs_t *>_cyb_malloc(sizeof(ncclEpDispatchOutputs_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating DispatchOutputs")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpDispatchOutputs_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpDispatchOutputs_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -1809,7 +1845,7 @@ cdef class DispatchOutputs:
     @staticmethod
     def from_buffer(buffer):
         """Create an DispatchOutputs instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpDispatchOutputs_t), DispatchOutputs)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpDispatchOutputs_t), DispatchOutputs)
 
     @staticmethod
     def from_data(data):
@@ -1818,7 +1854,7 @@ cdef class DispatchOutputs:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `dispatch_outputs_dtype` holding the data.
         """
-        return __from_data(data, "dispatch_outputs_dtype", dispatch_outputs_dtype, DispatchOutputs)
+        return _cyb_from_data(data, "dispatch_outputs_dtype", dispatch_outputs_dtype, DispatchOutputs)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -1833,10 +1869,10 @@ cdef class DispatchOutputs:
             raise ValueError("ptr must not be null (0)")
         cdef DispatchOutputs obj = DispatchOutputs.__new__(DispatchOutputs)
         if owner is None:
-            obj._ptr = <ncclEpDispatchOutputs_t *>malloc(sizeof(ncclEpDispatchOutputs_t))
+            obj._ptr = <ncclEpDispatchOutputs_t *>_cyb_malloc(sizeof(ncclEpDispatchOutputs_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating DispatchOutputs")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpDispatchOutputs_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpDispatchOutputs_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -1848,15 +1884,16 @@ cdef class DispatchOutputs:
 
 
 cdef _get_combine_inputs_dtype_offsets():
-    cdef ncclEpCombineInputs_t pod = ncclEpCombineInputs_t()
+    cdef ncclEpCombineInputs_t pod
     return _numpy.dtype({
-        'names': ['size_', 'magic', 'tokens', 'topk_weights'],
-        'formats': [_numpy.uint32, _numpy.uint32, _numpy.intp, _numpy.intp],
+        'names': ['size_', 'magic', 'tokens', 'topk_weights', 'scales'],
+        'formats': [_numpy.uint32, _numpy.uint32, _numpy.intp, _numpy.intp, _numpy.intp],
         'offsets': [
             (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.magic)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.tokens)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.topk_weights)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.scales)) - (<intptr_t>&pod),
         ],
         'itemsize': sizeof(ncclEpCombineInputs_t),
     })
@@ -1876,7 +1913,7 @@ cdef class CombineInputs:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpCombineInputs_t *>calloc(1, sizeof(ncclEpCombineInputs_t))
+        self._ptr = <ncclEpCombineInputs_t *>_cyb_calloc(1, sizeof(ncclEpCombineInputs_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating CombineInputs")
         self._owner = None
@@ -1891,7 +1928,7 @@ cdef class CombineInputs:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.CombineInputs object at {hex(id(self))}>"
@@ -1912,20 +1949,20 @@ cdef class CombineInputs:
         if not isinstance(other, CombineInputs):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpCombineInputs_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpCombineInputs_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpCombineInputs_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpCombineInputs_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpCombineInputs_t *>malloc(sizeof(ncclEpCombineInputs_t))
+            self._ptr = <ncclEpCombineInputs_t *>_cyb_malloc(sizeof(ncclEpCombineInputs_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating CombineInputs")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpCombineInputs_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpCombineInputs_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -1976,10 +2013,21 @@ cdef class CombineInputs:
             raise ValueError("This CombineInputs instance is read-only")
         self._ptr[0].topk_weights = <ncclEpTensor_t*><intptr_t>val
 
+    @property
+    def scales(self):
+        """int: """
+        return <intptr_t>(self._ptr[0].scales)
+
+    @scales.setter
+    def scales(self, val):
+        if self._readonly:
+            raise ValueError("This CombineInputs instance is read-only")
+        self._ptr[0].scales = <ncclEpTensor_t*><intptr_t>val
+
     @staticmethod
     def from_buffer(buffer):
         """Create an CombineInputs instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpCombineInputs_t), CombineInputs)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpCombineInputs_t), CombineInputs)
 
     @staticmethod
     def from_data(data):
@@ -1988,7 +2036,7 @@ cdef class CombineInputs:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `combine_inputs_dtype` holding the data.
         """
-        return __from_data(data, "combine_inputs_dtype", combine_inputs_dtype, CombineInputs)
+        return _cyb_from_data(data, "combine_inputs_dtype", combine_inputs_dtype, CombineInputs)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -2003,10 +2051,10 @@ cdef class CombineInputs:
             raise ValueError("ptr must not be null (0)")
         cdef CombineInputs obj = CombineInputs.__new__(CombineInputs)
         if owner is None:
-            obj._ptr = <ncclEpCombineInputs_t *>malloc(sizeof(ncclEpCombineInputs_t))
+            obj._ptr = <ncclEpCombineInputs_t *>_cyb_malloc(sizeof(ncclEpCombineInputs_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating CombineInputs")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpCombineInputs_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpCombineInputs_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -2018,7 +2066,7 @@ cdef class CombineInputs:
 
 
 cdef _get_combine_outputs_dtype_offsets():
-    cdef ncclEpCombineOutputs_t pod = ncclEpCombineOutputs_t()
+    cdef ncclEpCombineOutputs_t pod
     return _numpy.dtype({
         'names': ['size_', 'magic', 'tokens', 'topk_weights'],
         'formats': [_numpy.uint32, _numpy.uint32, _numpy.intp, _numpy.intp],
@@ -2046,7 +2094,7 @@ cdef class CombineOutputs:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpCombineOutputs_t *>calloc(1, sizeof(ncclEpCombineOutputs_t))
+        self._ptr = <ncclEpCombineOutputs_t *>_cyb_calloc(1, sizeof(ncclEpCombineOutputs_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating CombineOutputs")
         self._owner = None
@@ -2061,7 +2109,7 @@ cdef class CombineOutputs:
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.CombineOutputs object at {hex(id(self))}>"
@@ -2082,20 +2130,20 @@ cdef class CombineOutputs:
         if not isinstance(other, CombineOutputs):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpCombineOutputs_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpCombineOutputs_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpCombineOutputs_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpCombineOutputs_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpCombineOutputs_t *>malloc(sizeof(ncclEpCombineOutputs_t))
+            self._ptr = <ncclEpCombineOutputs_t *>_cyb_malloc(sizeof(ncclEpCombineOutputs_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating CombineOutputs")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpCombineOutputs_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpCombineOutputs_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -2149,7 +2197,7 @@ cdef class CombineOutputs:
     @staticmethod
     def from_buffer(buffer):
         """Create an CombineOutputs instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpCombineOutputs_t), CombineOutputs)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpCombineOutputs_t), CombineOutputs)
 
     @staticmethod
     def from_data(data):
@@ -2158,7 +2206,7 @@ cdef class CombineOutputs:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `combine_outputs_dtype` holding the data.
         """
-        return __from_data(data, "combine_outputs_dtype", combine_outputs_dtype, CombineOutputs)
+        return _cyb_from_data(data, "combine_outputs_dtype", combine_outputs_dtype, CombineOutputs)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -2173,10 +2221,10 @@ cdef class CombineOutputs:
             raise ValueError("ptr must not be null (0)")
         cdef CombineOutputs obj = CombineOutputs.__new__(CombineOutputs)
         if owner is None:
-            obj._ptr = <ncclEpCombineOutputs_t *>malloc(sizeof(ncclEpCombineOutputs_t))
+            obj._ptr = <ncclEpCombineOutputs_t *>_cyb_malloc(sizeof(ncclEpCombineOutputs_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating CombineOutputs")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpCombineOutputs_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpCombineOutputs_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -2188,10 +2236,10 @@ cdef class CombineOutputs:
 
 
 cdef _get_group_config_dtype_offsets():
-    cdef ncclEpGroupConfig_t pod = ncclEpGroupConfig_t()
+    cdef ncclEpGroupConfig_t pod
     return _numpy.dtype({
-        'names': ['size_', 'magic', 'version', 'algorithm', 'num_experts', 'max_dispatch_tokens_per_rank', 'max_recv_tokens_per_rank', 'max_token_bytes', 'rdma_buffer_size', 'num_qp_per_rank', 'num_channels', 'max_num_sms', 'alloc', 'enable_mask', 'timeout_ns', 'zero_copy', 'overflow_policy', 'num_topk'],
-        'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(unsigned long int))), _numpy.uint32, _numpy.uint32, _numpy.uint32, alloc_config_dtype, _numpy.uint32, _numpy.uint64, _numpy.int32, _numpy.int32, _numpy.uint32],
+        'names': ['size_', 'magic', 'version', 'algorithm', 'num_experts', 'max_dispatch_tokens_per_rank', 'max_recv_tokens_per_rank', 'max_token_bytes', 'rdma_buffer_size', 'num_qp_per_rank', 'num_channels', 'max_num_sms', 'alloc', 'enable_mask', 'timeout_ns', 'zero_copy', 'overflow_policy', 'num_topk', 'padding_v2'],
+        'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(unsigned long int))), _numpy.uint32, _numpy.uint32, _numpy.uint32, alloc_config_dtype, _numpy.uint32, _numpy.uint64, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4)],
         'offsets': [
             (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.magic)) - (<intptr_t>&pod),
@@ -2211,6 +2259,7 @@ cdef _get_group_config_dtype_offsets():
             (<intptr_t>&(pod.zero_copy)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.overflow_policy)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.num_topk)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.padding_v2)) - (<intptr_t>&pod),
         ],
         'itemsize': sizeof(ncclEpGroupConfig_t),
     })
@@ -2230,7 +2279,7 @@ cdef class GroupConfig:
         bint _readonly
 
     def __init__(self):
-        self._ptr = <ncclEpGroupConfig_t *>calloc(1, sizeof(ncclEpGroupConfig_t))
+        self._ptr = <ncclEpGroupConfig_t *>_cyb_calloc(1, sizeof(ncclEpGroupConfig_t))
         if self._ptr == NULL:
             raise MemoryError("Error allocating GroupConfig")
         self._owner = None
@@ -2239,14 +2288,15 @@ cdef class GroupConfig:
 
         self._ptr[0].size = sizeof(ncclEpGroupConfig_t)
         self._ptr[0].magic = 0xC00FFFEE
-        self._ptr[0].version = 1
+        # = NCCL_EP_API_VERSION; bump with the header.
+        self._ptr[0].version = 2
 
     def __dealloc__(self):
         cdef ncclEpGroupConfig_t *ptr
         if self._owned and self._ptr != NULL:
             ptr = self._ptr
             self._ptr = NULL
-            free(ptr)
+            _cyb_free(ptr)
 
     def __repr__(self):
         return f"<{__name__}.GroupConfig object at {hex(id(self))}>"
@@ -2267,20 +2317,20 @@ cdef class GroupConfig:
         if not isinstance(other, GroupConfig):
             return False
         other_ = other
-        return (memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpGroupConfig_t)) == 0)
+        return (_cyb_memcmp(<void *><intptr_t>(self._ptr), <void *><intptr_t>(other_._ptr), sizeof(ncclEpGroupConfig_t)) == 0)
 
-    def __getbuffer__(self, Py_buffer *buffer, int flags):
-        __getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpGroupConfig_t), self._readonly)
+    def __getbuffer__(self, _cyb_cpython.Py_buffer *buffer, int flags):
+        _cyb___getbuffer(self, buffer, <void *>self._ptr, sizeof(ncclEpGroupConfig_t), self._readonly)
 
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
     def __setitem__(self, key, val):
         if key == 0 and isinstance(val, _numpy.ndarray):
-            self._ptr = <ncclEpGroupConfig_t *>malloc(sizeof(ncclEpGroupConfig_t))
+            self._ptr = <ncclEpGroupConfig_t *>_cyb_malloc(sizeof(ncclEpGroupConfig_t))
             if self._ptr == NULL:
                 raise MemoryError("Error allocating GroupConfig")
-            memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpGroupConfig_t))
+            _cyb_memcpy(<void*>self._ptr, <void*><intptr_t>val.ctypes.data, sizeof(ncclEpGroupConfig_t))
             self._owner = None
             self._owned = True
             self._readonly = not val.flags.writeable
@@ -2290,14 +2340,18 @@ cdef class GroupConfig:
     @property
     def alloc(self):
         """AllocConfig: """
-        return AllocConfig.from_ptr(<intptr_t>&(self._ptr[0].alloc), self._readonly, self)
+        return AllocConfig.from_ptr(
+            <intptr_t>&(self._ptr[0].alloc),
+            readonly=self._readonly,
+            owner=self,
+        )
 
     @alloc.setter
     def alloc(self, val):
         if self._readonly:
             raise ValueError("This GroupConfig instance is read-only")
         cdef AllocConfig val_ = val
-        memcpy(<void *>&(self._ptr[0].alloc), <void *>(val_._get_ptr()), sizeof(ncclEpAllocConfig_t) * 1)
+        _cyb_memcpy(<void *>&(self._ptr[0].alloc), <void *>(val_._get_ptr()), sizeof(ncclEpAllocConfig_t) * 1)
 
     @property
     def size_(self):
@@ -2486,10 +2540,27 @@ cdef class GroupConfig:
             raise ValueError("This GroupConfig instance is read-only")
         self._ptr[0].num_topk = val
 
+    @property
+    def padding_v2(self):
+        """~_numpy.uint8: (array of length 4)."""
+        cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c", allocate_buffer=False)
+        arr.data = <char *>(&(self._ptr[0].padding_v2))
+        return _numpy.asarray(arr)
+
+    @padding_v2.setter
+    def padding_v2(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        if len(val) != 4:
+            raise ValueError(f"Expected length { 4 } for field padding_v2, got {len(val)}")
+        cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c")
+        arr[:] = _numpy.asarray(val, dtype=_numpy.uint8)
+        _cyb_memcpy(<void *>(&(self._ptr[0].padding_v2)), <void *>(arr.data), sizeof(unsigned char) * len(val))
+
     @staticmethod
     def from_buffer(buffer):
         """Create an GroupConfig instance with the memory from the given buffer."""
-        return __from_buffer(buffer, sizeof(ncclEpGroupConfig_t), GroupConfig)
+        return _cyb_from_buffer(buffer, sizeof(ncclEpGroupConfig_t), GroupConfig)
 
     @staticmethod
     def from_data(data):
@@ -2498,7 +2569,7 @@ cdef class GroupConfig:
         Args:
             data (_numpy.ndarray): a single-element array of dtype `group_config_dtype` holding the data.
         """
-        return __from_data(data, "group_config_dtype", group_config_dtype, GroupConfig)
+        return _cyb_from_data(data, "group_config_dtype", group_config_dtype, GroupConfig)
 
     @staticmethod
     def from_ptr(intptr_t ptr, bint readonly=False, object owner=None):
@@ -2513,10 +2584,10 @@ cdef class GroupConfig:
             raise ValueError("ptr must not be null (0)")
         cdef GroupConfig obj = GroupConfig.__new__(GroupConfig)
         if owner is None:
-            obj._ptr = <ncclEpGroupConfig_t *>malloc(sizeof(ncclEpGroupConfig_t))
+            obj._ptr = <ncclEpGroupConfig_t *>_cyb_malloc(sizeof(ncclEpGroupConfig_t))
             if obj._ptr == NULL:
                 raise MemoryError("Error allocating GroupConfig")
-            memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpGroupConfig_t))
+            _cyb_memcpy(<void*>(obj._ptr), <void*>ptr, sizeof(ncclEpGroupConfig_t))
             obj._owner = None
             obj._owned = True
         else:
@@ -2531,14 +2602,14 @@ cdef class GroupConfig:
 # Enum
 ###############################################################################
 
-class Algorithm(_IntEnum):
+class Algorithm(_cyb_IntEnum):
     """
     See `ncclEpAlgorithm_t`.
     """
     LOW_LATENCY = NCCL_EP_ALGO_LOW_LATENCY
     HIGH_THROUGHPUT = NCCL_EP_ALGO_HIGH_THROUGHPUT
 
-class OverflowPolicy(_IntEnum):
+class OverflowPolicy(_cyb_IntEnum):
     """
     See `ncclEpOverflowPolicy_t`.
     """
@@ -2546,7 +2617,7 @@ class OverflowPolicy(_IntEnum):
     OVERFLOW_TRAP = NCCL_EP_OVERFLOW_TRAP
     OVERFLOW_DROP = NCCL_EP_OVERFLOW_DROP
 
-class Layout(_IntEnum):
+class Layout(_cyb_IntEnum):
     """
     See `ncclEpLayout_t`.
     """
@@ -2555,14 +2626,14 @@ class Layout(_IntEnum):
     RANK_MAJOR = NCCL_EP_LAYOUT_RANK_MAJOR
     FLAT = NCCL_EP_LAYOUT_FLAT
 
-class PassDir(_IntEnum):
+class PassDir(_cyb_IntEnum):
     """
     See `ncclEpPassDir_t`.
     """
     FWD_PASS = NCCL_EP_FWD_PASS
     BWD_PASS = NCCL_EP_BWD_PASS
 
-class ZeroCopyMode(_IntEnum):
+class ZeroCopyMode(_cyb_IntEnum):
     """
     See `ncclEpZeroCopyMode_t`.
     """
@@ -2570,7 +2641,7 @@ class ZeroCopyMode(_IntEnum):
     ZERO_COPY_OFF = NCCL_EP_ZERO_COPY_OFF
     ZERO_COPY_ON = NCCL_EP_ZERO_COPY_ON
 
-class ExpertIdKind(_IntEnum):
+class ExpertIdKind(_cyb_IntEnum):
     """
     See `ncclEpExpertIdKind_t`.
     """
@@ -2578,19 +2649,20 @@ class ExpertIdKind(_IntEnum):
     EXPERT_ID_LOCAL = NCCL_EP_EXPERT_ID_LOCAL
     EXPERT_ID_GLOBAL = NCCL_EP_EXPERT_ID_GLOBAL
 
-class DispatchQuantizationRecipe(_IntEnum):
+class DispQuant(_cyb_IntEnum):
     """
-    See `ncclEpDispatchQuantizationRecipe_t`.
+    See `ncclEpDispQuant_t`.
     """
-    DISPATCH_QUANT_NONE = NCCL_EP_DISPATCH_QUANT_NONE
-    DISPATCH_QUANT_SCALES_FORWARD = NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD
-    DISPATCH_QUANT_DS_FP8E3M4 = NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4
+    NONE = NCCL_EP_DISP_QUANT_NONE
+    FWD = NCCL_EP_DISP_QUANT_FWD
+    DS_FP8E3M4 = NCCL_EP_DISP_QUANT_DS_FP8E3M4
 
-class CombineQuantizationRecipe(_IntEnum):
+class CombQuant(_cyb_IntEnum):
     """
-    See `ncclEpCombineQuantizationRecipe_t`.
+    See `ncclEpCombQuant_t`.
     """
-    COMBINE_QUANT_NONE = NCCL_EP_COMBINE_QUANT_NONE
+    NONE = NCCL_EP_COMB_QUANT_NONE
+    NVFP4 = NCCL_EP_COMB_QUANT_NVFP4
 
 
 ###############################################################################
@@ -2706,6 +2778,40 @@ cpdef complete(intptr_t handle, intptr_t config, intptr_t stream):
     check_status(__status__)
 
 
+cpdef mask_query(intptr_t ep_group, intptr_t mask_status, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpMaskQuery(<Group>ep_group, <int*>mask_status, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef mask_update(intptr_t ep_group, intptr_t mask, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpMaskUpdate(<Group>ep_group, <const int*>mask, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef mask_clean(intptr_t ep_group, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpMaskClean(<Group>ep_group, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef int get_async_error(intptr_t ep_group) except? -1:
+    cdef int error_out
+    with nogil:
+        __status__ = ncclEpGetAsyncError(<Group>ep_group, &error_out)
+    check_status(__status__)
+    return error_out
+
+
+cpdef error_clear(intptr_t ep_group):
+    with nogil:
+        __status__ = ncclEpErrorClear(<Group>ep_group)
+    check_status(__status__)
+
+
+# Hand-written: reports the .so the symbols resolved to; not a C entry point.
 cpdef object get_library_path():
     from ._internal.nccl_ep import _inspect_loaded_library_path
     return _inspect_loaded_library_path()
+del _cyb_IntEnum

@@ -2,10 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# This code was automatically generated with version 0.1.0. Do not modify it directly.
+# This code was automatically generated with version 0.2.0. Do not modify it directly.
 
+
+# <<<< PREAMBLE CONTENT >>>>
 
 from libc.stdint cimport uint64_t
+
+
+# <<<< END OF PREAMBLE CONTENT >>>>
 
 from nccl.bindings.cynccl cimport ncclResult_t, ncclDataType_t, _NCCLRESULT_T_INTERNAL_LOADING_ERROR
 
@@ -45,13 +50,14 @@ ctypedef enum ncclEpExpertIdKind_t "ncclEpExpertIdKind_t":
     NCCL_EP_EXPERT_ID_LOCAL "NCCL_EP_EXPERT_ID_LOCAL" = 1
     NCCL_EP_EXPERT_ID_GLOBAL "NCCL_EP_EXPERT_ID_GLOBAL" = 2
 
-ctypedef enum ncclEpDispatchQuantizationRecipe_t "ncclEpDispatchQuantizationRecipe_t":
-    NCCL_EP_DISPATCH_QUANT_NONE "NCCL_EP_DISPATCH_QUANT_NONE" = 0
-    NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD "NCCL_EP_DISPATCH_QUANT_SCALES_FORWARD" = 1
-    NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4 "NCCL_EP_DISPATCH_QUANT_DS_FP8E3M4" = 2
+ctypedef enum ncclEpDispQuant_t "ncclEpDispQuant_t":
+    NCCL_EP_DISP_QUANT_NONE "NCCL_EP_DISP_QUANT_NONE" = 0
+    NCCL_EP_DISP_QUANT_FWD "NCCL_EP_DISP_QUANT_FWD" = 1
+    NCCL_EP_DISP_QUANT_DS_FP8E3M4 "NCCL_EP_DISP_QUANT_DS_FP8E3M4" = 2
 
-ctypedef enum ncclEpCombineQuantizationRecipe_t "ncclEpCombineQuantizationRecipe_t":
-    NCCL_EP_COMBINE_QUANT_NONE "NCCL_EP_COMBINE_QUANT_NONE" = 0
+ctypedef enum ncclEpCombQuant_t "ncclEpCombQuant_t":
+    NCCL_EP_COMB_QUANT_NONE "NCCL_EP_COMB_QUANT_NONE" = 0
+    NCCL_EP_COMB_QUANT_NVFP4 "NCCL_EP_COMB_QUANT_NVFP4" = 1
 
 
 # types
@@ -99,14 +105,14 @@ ctypedef struct ncclEpDispatchConfig_t 'ncclEpDispatchConfig_t':
     unsigned int send_only
     unsigned int round_scales
     ncclEpPassDir_t pass_direction
-    ncclEpDispatchQuantizationRecipe_t quantization_recipe
+    ncclEpDispQuant_t quant_recipe
 
 ctypedef struct ncclEpCombineConfig_t 'ncclEpCombineConfig_t':
     unsigned int size
     unsigned int magic
     unsigned int send_only
     ncclEpPassDir_t pass_direction
-    ncclEpCombineQuantizationRecipe_t quantization_recipe
+    ncclEpCombQuant_t quant_recipe
 
 ctypedef struct ncclEpCompleteConfig_t 'ncclEpCompleteConfig_t':
     unsigned int size
@@ -135,6 +141,7 @@ ctypedef struct ncclEpLayoutInfo_t 'ncclEpLayoutInfo_t':
     ncclEpTensor_t* expert_offsets
     ncclEpTensor_t* recv_total_counter
     ncclEpExpertIdKind_t recv_topk_idx_kind
+    unsigned char padding_v2[4]
 
 ctypedef struct ncclEpDispatchInputs_t 'ncclEpDispatchInputs_t':
     unsigned int size
@@ -156,6 +163,7 @@ ctypedef struct ncclEpCombineInputs_t 'ncclEpCombineInputs_t':
     unsigned int magic
     ncclEpTensor_t* tokens
     ncclEpTensor_t* topk_weights
+    ncclEpTensor_t* scales
 
 ctypedef struct ncclEpCombineOutputs_t 'ncclEpCombineOutputs_t':
     unsigned int size
@@ -182,6 +190,7 @@ ctypedef struct ncclEpGroupConfig_t 'ncclEpGroupConfig_t':
     ncclEpZeroCopyMode_t zero_copy
     ncclEpOverflowPolicy_t overflow_policy
     unsigned int num_topk
+    unsigned char padding_v2[4]
 
 
 ###############################################################################
@@ -201,3 +210,8 @@ cdef ncclResult_t ncclEpHandleDestroy(ncclEpHandle_t handle) except?_NCCLRESULT_
 cdef ncclResult_t ncclEpDispatch(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpCombine(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpComplete(ncclEpHandle_t handle, const ncclEpCompleteConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpMaskQuery(ncclEpGroup_t ep_group, int* mask_status, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpMaskUpdate(ncclEpGroup_t ep_group, const int* mask, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil

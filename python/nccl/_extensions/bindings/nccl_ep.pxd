@@ -2,9 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# This code was automatically generated with version 0.1.0. Do not modify it directly.
+# This code was automatically generated with version 0.2.0. Do not modify it directly.
+
+
+
+# <<<< PREAMBLE CONTENT >>>>
 
 from libc.stdint cimport intptr_t
+
+
+# <<<< END OF PREAMBLE CONTENT >>>>
 
 from .cynccl_ep cimport *
 
@@ -33,8 +40,8 @@ ctypedef ncclEpLayout_t _Layout
 ctypedef ncclEpPassDir_t _PassDir
 ctypedef ncclEpZeroCopyMode_t _ZeroCopyMode
 ctypedef ncclEpExpertIdKind_t _ExpertIdKind
-ctypedef ncclEpDispatchQuantizationRecipe_t _DispatchQuantizationRecipe
-ctypedef ncclEpCombineQuantizationRecipe_t _CombineQuantizationRecipe
+ctypedef ncclEpDispQuant_t _DispQuant
+ctypedef ncclEpCombQuant_t _CombQuant
 
 
 ###############################################################################
@@ -54,4 +61,9 @@ cpdef handle_destroy(intptr_t handle)
 cpdef dispatch(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream)
 cpdef combine(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t config, intptr_t stream)
 cpdef complete(intptr_t handle, intptr_t config, intptr_t stream)
+cpdef mask_query(intptr_t ep_group, intptr_t mask_status, intptr_t stream)
+cpdef mask_update(intptr_t ep_group, intptr_t mask, intptr_t stream)
+cpdef mask_clean(intptr_t ep_group, intptr_t stream)
+cpdef int get_async_error(intptr_t ep_group) except? -1
+cpdef error_clear(intptr_t ep_group)
 cpdef object get_library_path()

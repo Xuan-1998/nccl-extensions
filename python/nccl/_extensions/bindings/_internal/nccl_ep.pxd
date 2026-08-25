@@ -1,8 +1,8 @@
-# Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. ALL RIGHTS RESERVED.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. ALL RIGHTS RESERVED.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# This code was automatically generated with version 0.1.0. Do not modify it directly.
+# This code was automatically generated with version 0.2.0. Do not modify it directly.
 
 from ..cynccl_ep cimport *
 
@@ -24,3 +24,8 @@ cdef ncclResult_t _ncclEpHandleDestroy(ncclEpHandle_t handle) except?_NCCLRESULT
 cdef ncclResult_t _ncclEpDispatch(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t _ncclEpCombine(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t _ncclEpComplete(ncclEpHandle_t handle, const ncclEpCompleteConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t _ncclEpMaskQuery(ncclEpGroup_t ep_group, int* mask_status, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t _ncclEpMaskUpdate(ncclEpGroup_t ep_group, const int* mask, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t _ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t _ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t _ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil

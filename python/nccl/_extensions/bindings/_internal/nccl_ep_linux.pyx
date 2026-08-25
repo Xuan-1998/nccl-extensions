@@ -2,58 +2,70 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# This code was automatically generated with version 0.1.0. Do not modify it directly.
+# This code was automatically generated with version 0.2.0. Do not modify it directly.
 
-from libc.stdint cimport intptr_t, uint64_t, uintptr_t
 
-import os
-import threading
+# <<<< PREAMBLE CONTENT >>>>
+
+cdef extern from * nogil:
+    """
+    #if defined(_MSC_VER) && !defined(__clang__)
+        #include <intrin.h>
+        static __forceinline int atomic_int_load(int *p) {
+            int v = *(int volatile *)p; _ReadBarrier(); return v;
+        }
+        static __forceinline void atomic_int_store(int *p, int v) {
+            _WriteBarrier(); *(int volatile *)p = v;
+        }
+    #elif defined(__cplusplus)
+        /* GCC/Clang __atomic builtins work in any C++ standard without headers */
+        static inline int atomic_int_load(int *p) {
+            return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+        }
+        static inline void atomic_int_store(int *p, int v) {
+            __atomic_store_n(p, v, __ATOMIC_RELEASE);
+        }
+    #else
+        #include <stdatomic.h>
+        static inline int atomic_int_load(int *p) {
+            return (int)atomic_load_explicit((atomic_int *)p, memory_order_acquire);
+        }
+        static inline void atomic_int_store(int *p, int v) {
+            atomic_store_explicit((atomic_int *)p, v, memory_order_release);
+        }
+    #endif
+
+    """
+    cdef int _cyb_atomic_int_load "atomic_int_load"(int *p) nogil
+    cdef void _cyb_atomic_int_store "atomic_int_store"(int *p, int v) nogil
+
+cdef extern from "<dlfcn.h>":
+    void* _cyb_dlsym "dlsym"(void*, const char*) nogil
+    const void * _cyb_RTLD_DEFAULT "RTLD_DEFAULT"
+
+from libc.stdint cimport intptr_t
+
+import threading as _cyb_threading
+
+cdef int _cyb___py_nccl_ep_init = 0
+cdef dict _cyb_func_ptrs = None
+cdef object _cyb_symbol_lock = _cyb_threading.Lock()
+
+# <<<< END OF PREAMBLE CONTENT >>>>
 
 from .utils import FunctionNotFoundError, NotSupportedError
 
-from cuda.pathfinder import load_nvidia_dynamic_lib
+import os
 
-
-###############################################################################
-# Extern
-###############################################################################
-
-# You must 'from .utils import NotSupportedError' before using this template
 
 cdef extern from "<dlfcn.h>" nogil:
     void* dlopen(const char*, int)
     char* dlerror()
-    void* dlsym(void*, const char*)
-    int dlclose(void*)
 
     enum:
-        RTLD_LAZY
         RTLD_NOW
         RTLD_GLOBAL
-        RTLD_LOCAL
 
-    const void* RTLD_DEFAULT 'RTLD_DEFAULT'
-
-cdef int get_cuda_version():
-    cdef void* handle = NULL
-    cdef int err, driver_ver = 0
-
-    # Load driver to check version
-    handle = dlopen('libcuda.so.1', RTLD_NOW | RTLD_GLOBAL)
-    if handle == NULL:
-        err_msg = dlerror()
-        raise NotSupportedError(f'CUDA driver is not found ({err_msg.decode()})')
-    cuDriverGetVersion = dlsym(handle, "cuDriverGetVersion")
-    if cuDriverGetVersion == NULL:
-        raise RuntimeError('Did not find cuDriverGetVersion symbol in libcuda.so.1')
-    err = (<int (*)(int*) noexcept nogil>cuDriverGetVersion)(&driver_ver)
-    if err != 0:
-        raise RuntimeError(f'cuDriverGetVersion returned error code {err}')
-
-    return driver_ver
-
-
-cdef extern from "<dlfcn.h>" nogil:
     ctypedef struct Dl_info:
         const char* dli_fname
         void* dli_fbase
@@ -63,24 +75,22 @@ cdef extern from "<dlfcn.h>" nogil:
 
 
 ###############################################################################
-# Library resolution (mirrors cuda.pathfinder.load_nvidia_dynamic_lib precedence,
-# adapted for libnccl_ep.so which is not registered as an NVIDIA pip wheel.)
+# Library resolution. libnccl_ep.so is not an NVIDIA wheel library, so it is
+# located here instead of through cuda.pathfinder.
 ###############################################################################
 
-# Resolved at first import via _resolve_library_path() below. Path lookup runs
-# once, then dlopen handle is cached in the lowpp nccl_ep init guard.
-#
-# Each library's .so ships under its own facade package -- nccl_ep -> nccl/ep/,
-# nccl_m2n -> nccl/m2n/ -- so derive that directory from the library name rather
-# than hardcoding one library's.
+# The .so ships under this library's facade package (nccl_ep -> nccl/ep/lib),
+# so derive that directory from nccl_ep rather than hardcoding it.
+# _resolve_library_path() runs on the first call that needs a symbol, not at
+# import; after that the generated init guard holds the resolved pointers.
 _PACKAGE_LIB_RELPATH = os.path.join(
     "nccl_ep".removeprefix("nccl_"), "lib", "libnccl_ep.so"
 )
 
 
 def _resolve_library_path() -> str:
-    # 1. nccl-extensions package path (replaces cuda.pathfinder's NVIDIA-pip-wheel
-    #    step). libnccl_ep.so is at nccl/<lib>/lib/; this file lives in
+    # 1. nccl-extensions package path. libnccl_ep.so is at nccl/<lib>/lib/;
+    #    this file lives in
     #    nccl/_extensions/bindings/_internal/, so go up three dirs to reach nccl/.
     pkg_lib = os.path.normpath(os.path.join(
         os.path.dirname(__file__), "..", "..", "..", _PACKAGE_LIB_RELPATH
@@ -115,9 +125,6 @@ def _resolve_library_path() -> str:
 # Wrapper init
 ###############################################################################
 
-cdef object __symbol_lock = threading.Lock()
-cdef bint __py_nccl_ep_init = False
-
 cdef void* __ncclEpGetVersion = NULL
 cdef void* __ncclEpTensorAlloc = NULL
 cdef void* __ncclEpTensorDestroy = NULL
@@ -131,143 +138,161 @@ cdef void* __ncclEpHandleDestroy = NULL
 cdef void* __ncclEpDispatch = NULL
 cdef void* __ncclEpCombine = NULL
 cdef void* __ncclEpComplete = NULL
+cdef void* __ncclEpMaskQuery = NULL
+cdef void* __ncclEpMaskUpdate = NULL
+cdef void* __ncclEpMaskClean = NULL
+cdef void* __ncclEpGetAsyncError = NULL
+cdef void* __ncclEpErrorClear = NULL
 
-
-cdef void* load_library() except* with gil:
-    # libnccl_ep.so has NEEDED libnccl.so.2. Pre-load it with RTLD_GLOBAL so the
-    # SONAME is already mapped when libnccl_ep.so's NEEDED is resolved,
-    # without depending on filesystem search.
-    load_nvidia_dynamic_lib("nccl")
-
-    cdef bytes path_bytes = _resolve_library_path().encode()
-    cdef void* handle = dlopen(path_bytes, RTLD_NOW | RTLD_GLOBAL)
-    if handle == NULL:
-        err_msg = dlerror()
-        raise RuntimeError(
-            f'Failed to dlopen libnccl_ep ({err_msg.decode()}); '
-            f'tried path {path_bytes.decode()!r}'
-        )
-    return handle
-
-
-cdef int _check_or_init_nccl_ep() except -1 nogil:
-    global __py_nccl_ep_init
-    if __py_nccl_ep_init:
-        return 0
-
+cdef int _init_nccl_ep() except -1 nogil:
+    global _cyb___py_nccl_ep_init
     cdef void* handle = NULL
+    with gil, _cyb_symbol_lock:
+        if _cyb___py_nccl_ep_init: return 0
 
-    with gil, __symbol_lock:
-        # Recheck the flag after obtaining the locks
-        if __py_nccl_ep_init:
-            return 0
-
-        # Load function
         global __ncclEpGetVersion
-        __ncclEpGetVersion = dlsym(RTLD_DEFAULT, 'ncclEpGetVersion')
+        __ncclEpGetVersion = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpGetVersion')
         if __ncclEpGetVersion == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpGetVersion = dlsym(handle, 'ncclEpGetVersion')
+            __ncclEpGetVersion = _cyb_dlsym(handle, 'ncclEpGetVersion')
 
         global __ncclEpTensorAlloc
-        __ncclEpTensorAlloc = dlsym(RTLD_DEFAULT, 'ncclEpTensorAlloc')
+        __ncclEpTensorAlloc = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpTensorAlloc')
         if __ncclEpTensorAlloc == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpTensorAlloc = dlsym(handle, 'ncclEpTensorAlloc')
+            __ncclEpTensorAlloc = _cyb_dlsym(handle, 'ncclEpTensorAlloc')
 
         global __ncclEpTensorDestroy
-        __ncclEpTensorDestroy = dlsym(RTLD_DEFAULT, 'ncclEpTensorDestroy')
+        __ncclEpTensorDestroy = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpTensorDestroy')
         if __ncclEpTensorDestroy == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpTensorDestroy = dlsym(handle, 'ncclEpTensorDestroy')
+            __ncclEpTensorDestroy = _cyb_dlsym(handle, 'ncclEpTensorDestroy')
 
         global __ncclEpCreateGroup
-        __ncclEpCreateGroup = dlsym(RTLD_DEFAULT, 'ncclEpCreateGroup')
+        __ncclEpCreateGroup = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpCreateGroup')
         if __ncclEpCreateGroup == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpCreateGroup = dlsym(handle, 'ncclEpCreateGroup')
+            __ncclEpCreateGroup = _cyb_dlsym(handle, 'ncclEpCreateGroup')
 
         global __ncclEpGroupDestroy
-        __ncclEpGroupDestroy = dlsym(RTLD_DEFAULT, 'ncclEpGroupDestroy')
+        __ncclEpGroupDestroy = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpGroupDestroy')
         if __ncclEpGroupDestroy == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpGroupDestroy = dlsym(handle, 'ncclEpGroupDestroy')
+            __ncclEpGroupDestroy = _cyb_dlsym(handle, 'ncclEpGroupDestroy')
 
         global __ncclEpHandleMemSize
-        __ncclEpHandleMemSize = dlsym(RTLD_DEFAULT, 'ncclEpHandleMemSize')
+        __ncclEpHandleMemSize = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpHandleMemSize')
         if __ncclEpHandleMemSize == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpHandleMemSize = dlsym(handle, 'ncclEpHandleMemSize')
+            __ncclEpHandleMemSize = _cyb_dlsym(handle, 'ncclEpHandleMemSize')
 
         global __ncclEpInitHandle
-        __ncclEpInitHandle = dlsym(RTLD_DEFAULT, 'ncclEpInitHandle')
+        __ncclEpInitHandle = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpInitHandle')
         if __ncclEpInitHandle == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpInitHandle = dlsym(handle, 'ncclEpInitHandle')
+            __ncclEpInitHandle = _cyb_dlsym(handle, 'ncclEpInitHandle')
 
         global __ncclEpUpdateHandle
-        __ncclEpUpdateHandle = dlsym(RTLD_DEFAULT, 'ncclEpUpdateHandle')
+        __ncclEpUpdateHandle = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpUpdateHandle')
         if __ncclEpUpdateHandle == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpUpdateHandle = dlsym(handle, 'ncclEpUpdateHandle')
+            __ncclEpUpdateHandle = _cyb_dlsym(handle, 'ncclEpUpdateHandle')
 
         global __ncclEpCreateHandle
-        __ncclEpCreateHandle = dlsym(RTLD_DEFAULT, 'ncclEpCreateHandle')
+        __ncclEpCreateHandle = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpCreateHandle')
         if __ncclEpCreateHandle == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpCreateHandle = dlsym(handle, 'ncclEpCreateHandle')
+            __ncclEpCreateHandle = _cyb_dlsym(handle, 'ncclEpCreateHandle')
 
         global __ncclEpHandleDestroy
-        __ncclEpHandleDestroy = dlsym(RTLD_DEFAULT, 'ncclEpHandleDestroy')
+        __ncclEpHandleDestroy = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpHandleDestroy')
         if __ncclEpHandleDestroy == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpHandleDestroy = dlsym(handle, 'ncclEpHandleDestroy')
+            __ncclEpHandleDestroy = _cyb_dlsym(handle, 'ncclEpHandleDestroy')
 
         global __ncclEpDispatch
-        __ncclEpDispatch = dlsym(RTLD_DEFAULT, 'ncclEpDispatch')
+        __ncclEpDispatch = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpDispatch')
         if __ncclEpDispatch == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpDispatch = dlsym(handle, 'ncclEpDispatch')
+            __ncclEpDispatch = _cyb_dlsym(handle, 'ncclEpDispatch')
 
         global __ncclEpCombine
-        __ncclEpCombine = dlsym(RTLD_DEFAULT, 'ncclEpCombine')
+        __ncclEpCombine = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpCombine')
         if __ncclEpCombine == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpCombine = dlsym(handle, 'ncclEpCombine')
+            __ncclEpCombine = _cyb_dlsym(handle, 'ncclEpCombine')
 
         global __ncclEpComplete
-        __ncclEpComplete = dlsym(RTLD_DEFAULT, 'ncclEpComplete')
+        __ncclEpComplete = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpComplete')
         if __ncclEpComplete == NULL:
             if handle == NULL:
                 handle = load_library()
-            __ncclEpComplete = dlsym(handle, 'ncclEpComplete')
-        __py_nccl_ep_init = True
+            __ncclEpComplete = _cyb_dlsym(handle, 'ncclEpComplete')
+
+        global __ncclEpMaskQuery
+        __ncclEpMaskQuery = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpMaskQuery')
+        if __ncclEpMaskQuery == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpMaskQuery = _cyb_dlsym(handle, 'ncclEpMaskQuery')
+
+        global __ncclEpMaskUpdate
+        __ncclEpMaskUpdate = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpMaskUpdate')
+        if __ncclEpMaskUpdate == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpMaskUpdate = _cyb_dlsym(handle, 'ncclEpMaskUpdate')
+
+        global __ncclEpMaskClean
+        __ncclEpMaskClean = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpMaskClean')
+        if __ncclEpMaskClean == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpMaskClean = _cyb_dlsym(handle, 'ncclEpMaskClean')
+
+        global __ncclEpGetAsyncError
+        __ncclEpGetAsyncError = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpGetAsyncError')
+        if __ncclEpGetAsyncError == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpGetAsyncError = _cyb_dlsym(handle, 'ncclEpGetAsyncError')
+
+        global __ncclEpErrorClear
+        __ncclEpErrorClear = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpErrorClear')
+        if __ncclEpErrorClear == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpErrorClear = _cyb_dlsym(handle, 'ncclEpErrorClear')
+
+        _cyb_atomic_int_store(<int *>&_cyb___py_nccl_ep_init, 1)
         return 0
 
+cdef inline int _check_or_init_nccl_ep() except -1 nogil:
+    if _cyb_atomic_int_load(<int *>&_cyb___py_nccl_ep_init):
+        return 0
 
-cdef dict func_ptrs = None
+    return _init_nccl_ep()
 
 
 cpdef dict _inspect_function_pointers():
-    global func_ptrs
-    if func_ptrs is not None:
-        return func_ptrs
+    global _cyb_func_ptrs
+    if _cyb_func_ptrs is not None:
+        return _cyb_func_ptrs
 
     _check_or_init_nccl_ep()
     cdef dict data = {}
-
     global __ncclEpGetVersion
     data["__ncclEpGetVersion"] = <intptr_t>__ncclEpGetVersion
 
@@ -307,21 +332,56 @@ cpdef dict _inspect_function_pointers():
     global __ncclEpComplete
     data["__ncclEpComplete"] = <intptr_t>__ncclEpComplete
 
-    func_ptrs = data
+    global __ncclEpMaskQuery
+    data["__ncclEpMaskQuery"] = <intptr_t>__ncclEpMaskQuery
+
+    global __ncclEpMaskUpdate
+    data["__ncclEpMaskUpdate"] = <intptr_t>__ncclEpMaskUpdate
+
+    global __ncclEpMaskClean
+    data["__ncclEpMaskClean"] = <intptr_t>__ncclEpMaskClean
+
+    global __ncclEpGetAsyncError
+    data["__ncclEpGetAsyncError"] = <intptr_t>__ncclEpGetAsyncError
+
+    global __ncclEpErrorClear
+    data["__ncclEpErrorClear"] = <intptr_t>__ncclEpErrorClear
+    _cyb_func_ptrs = data
     return data
 
 
 cpdef _inspect_function_pointer(str name):
-    global func_ptrs
-    if func_ptrs is None:
-        func_ptrs = _inspect_function_pointers()
-    return func_ptrs[name]
+    global _cyb_func_ptrs
+    if _cyb_func_ptrs is None:
+        _cyb_func_ptrs = _inspect_function_pointers()
+    return _cyb_func_ptrs[name]
+
+
+
+
+cdef void* load_library() except* with gil:
+    # libnccl_ep.so has NEEDED libnccl.so.2. Forcing nccl4py's loader to run
+    # maps that SONAME RTLD_GLOBAL first, so the NEEDED resolves without a
+    # filesystem search and nccl4py stays the one place that locates libnccl.
+    from nccl.bindings._internal import nccl as _nccl_loader
+    _nccl_loader._inspect_function_pointers()
+
+    cdef bytes path_bytes = _resolve_library_path().encode()
+    cdef void* handle = dlopen(path_bytes, RTLD_NOW | RTLD_GLOBAL)
+    if handle == NULL:
+        err_msg = dlerror()
+        raise RuntimeError(
+            f'Failed to dlopen libnccl_ep ({err_msg.decode()}); '
+            f'tried path {path_bytes.decode()!r}'
+        )
+    return handle
 
 
 cdef object __nccl_ep_loaded_so_path = None
 
 
 cpdef object _inspect_loaded_library_path():
+    import os
     # Path of the .so backing the loaded symbols, via dladdr() on a
     # resolved entry point. None if it cannot be determined.
     global __nccl_ep_loaded_so_path
@@ -477,3 +537,53 @@ cdef ncclResult_t _ncclEpComplete(ncclEpHandle_t handle, const ncclEpCompleteCon
             raise FunctionNotFoundError("function ncclEpComplete is not found")
     return (<ncclResult_t (*)(ncclEpHandle_t, const ncclEpCompleteConfig_t*, cudaStream_t) noexcept nogil>__ncclEpComplete)(
         handle, config, stream)
+
+
+cdef ncclResult_t _ncclEpMaskQuery(ncclEpGroup_t ep_group, int* mask_status, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpMaskQuery
+    _check_or_init_nccl_ep()
+    if __ncclEpMaskQuery == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpMaskQuery is not found")
+    return (<ncclResult_t (*)(ncclEpGroup_t, int*, cudaStream_t) noexcept nogil>__ncclEpMaskQuery)(
+        ep_group, mask_status, stream)
+
+
+cdef ncclResult_t _ncclEpMaskUpdate(ncclEpGroup_t ep_group, const int* mask, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpMaskUpdate
+    _check_or_init_nccl_ep()
+    if __ncclEpMaskUpdate == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpMaskUpdate is not found")
+    return (<ncclResult_t (*)(ncclEpGroup_t, const int*, cudaStream_t) noexcept nogil>__ncclEpMaskUpdate)(
+        ep_group, mask, stream)
+
+
+cdef ncclResult_t _ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpMaskClean
+    _check_or_init_nccl_ep()
+    if __ncclEpMaskClean == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpMaskClean is not found")
+    return (<ncclResult_t (*)(ncclEpGroup_t, cudaStream_t) noexcept nogil>__ncclEpMaskClean)(
+        ep_group, stream)
+
+
+cdef ncclResult_t _ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpGetAsyncError
+    _check_or_init_nccl_ep()
+    if __ncclEpGetAsyncError == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpGetAsyncError is not found")
+    return (<ncclResult_t (*)(ncclEpGroup_t, int*) noexcept nogil>__ncclEpGetAsyncError)(
+        ep_group, error_out)
+
+
+cdef ncclResult_t _ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpErrorClear
+    _check_or_init_nccl_ep()
+    if __ncclEpErrorClear == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpErrorClear is not found")
+    return (<ncclResult_t (*)(ncclEpGroup_t) noexcept nogil>__ncclEpErrorClear)(
+        ep_group)
