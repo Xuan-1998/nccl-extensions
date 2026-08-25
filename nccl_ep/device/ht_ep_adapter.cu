@@ -10,8 +10,8 @@
  */
 
 #include "nccl_device.h"
-#include "ht_ep_adapter.cuh"
-#include "ht_ep_configs.cuh"
+#include "device/ht_ep_adapter.cuh"
+#include "device/ht_ep_configs.cuh"
 #include "common.hpp"
 #include "jit/ht_combine_jit.cuh"
 #include "jit/ht_dispatch_jit.cuh"
@@ -105,6 +105,56 @@ template void
 convert_topk_to_routing_map<int32_t>(const int32_t*, uint8_t*, int32_t*, int, int, int, int, int, int, cudaStream_t);
 template void
 convert_topk_to_routing_map<int64_t>(const int64_t*, uint8_t*, int64_t*, int, int, int, int, int, int, cudaStream_t);
+
+// ============================================================================
+// Convert topk to uint16 topk routing map (pull dispatch only)
+// ============================================================================
+// Alternative to the bitmap routing map: keep each token's top-k global expert
+// ids in order (uint16), so the scan preserves the source top-k position of each
+// hit (needed for correct pull weight scatter). Invalid/padding slots and tail
+// rows [num_tokens, max_tokens) are filled with kTopkIdxInvalid so the AllGather
+// over max_tokens rows ships clean tails.
+template <typename TopkIdxT>
+__global__ void pack_topk_idx_kernel(
+    const TopkIdxT* __restrict__ topk_idx,   // [num_tokens, num_topk]
+    uint16_t* __restrict__ topk_idx_u16,           // [max_tokens, num_topk]
+    TopkIdxT* __restrict__ cached_topk_idx,  // [num_tokens, num_topk]; nullable
+    int num_tokens,
+    int max_tokens,                          // tail-fill bound (>= num_tokens)
+    int num_topk) {
+    int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= max_tokens) return;
+    uint16_t* out = topk_idx_u16 + static_cast<size_t>(token) * num_topk;
+    if (token >= num_tokens) {
+        for (int k = 0; k < num_topk; k++) out[k] = kTopkIdxInvalid;
+        return;
+    }
+    const TopkIdxT* in_row = topk_idx + static_cast<size_t>(token) * num_topk;
+    TopkIdxT* cache_row = cached_topk_idx ? cached_topk_idx + static_cast<size_t>(token) * num_topk : nullptr;
+    for (int k = 0; k < num_topk; k++) {
+        TopkIdxT expert = in_row[k];
+        if (cache_row) cache_row[k] = expert;
+        out[k] = (expert >= 0) ? static_cast<uint16_t>(expert) : kTopkIdxInvalid;
+    }
+}
+
+template <typename TopkIdxT>
+void pack_topk_idx(
+    const TopkIdxT* topk_idx,
+    uint16_t* topk_idx_u16,
+    TopkIdxT* cached_topk_idx,
+    int num_tokens,
+    int max_tokens,
+    int num_topk,
+    cudaStream_t stream) {
+    int block_size = 256;
+    int grid_size = (max_tokens + block_size - 1) / block_size;
+    pack_topk_idx_kernel<<<grid_size, block_size, 0, stream>>>(
+        topk_idx, topk_idx_u16, cached_topk_idx, num_tokens, max_tokens, num_topk);
+}
+
+template void pack_topk_idx<int32_t>(const int32_t*, uint16_t*, int32_t*, int, int, int, cudaStream_t);
+template void pack_topk_idx<int64_t>(const int64_t*, uint16_t*, int64_t*, int, int, int, cudaStream_t);
 
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob
@@ -423,6 +473,14 @@ ncclResult_t call_metadata_preprocessing(
     int32_t* flat2em_slot_map,
     int em_top_k,
     bool allow_overflow_drop,
+    // Pull dispatch: recv slot -> global source token id. Null unless pull is enabled.
+    int32_t* recv_slot_to_src,
+    // Pull dispatch: source top-k position of each hit (parallel to flat2em).
+    int32_t* srcpos_map,
+    // Pull dispatch: order-preserving uint16 topk routing map + gate. When use_topk_idx
+    // is set, the em-permute scan consumes global_topk_idx instead of the bitmap.
+    const uint16_t* global_topk_idx,
+    bool use_topk_idx,
     cudaStream_t stream) {
     if (expert_major && per_expert_token_counts == nullptr) {
         std::fprintf(stderr, "[nccl_ep] EXPERT_MAJOR remap requires per_expert_token_counts != nullptr\n");
@@ -467,7 +525,8 @@ ncclResult_t call_metadata_preprocessing(
                 /*has_expert_counts=*/false, /*has_em_permute=*/true));
 
             ::ht_ep::scan_flat_kernel_param_t sp{};
-            sp.input_routing_map = global_routing_map;
+            sp.input_routing_map =
+                use_topk_idx ? reinterpret_cast<const uint8_t*>(global_topk_idx) : global_routing_map;
             sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
             sp.sparse_to_dense_map = sparse_to_dense_map;
             sp.rdma_to_attn_map = rdma_to_attn_map;
@@ -496,6 +555,9 @@ ncclResult_t call_metadata_preprocessing(
             sp.em_padded_out_counts = padded_out_counts;
             sp.em_out_offsets = out_offsets;
             sp.em_actual_counts_out = actual_counts_out;
+            // Pull dispatch: inverse recv-slot map (null unless pull is enabled).
+            sp.recv_slot_to_src = recv_slot_to_src;
+            sp.srcpos_map = srcpos_map;
 
             jit::launch_scan_flat(
                 NUM_THREADS_PER_BLOCK,
@@ -506,6 +568,7 @@ ncclResult_t call_metadata_preprocessing(
                 /*enable_per_expert_counts=*/false,
                 /*enable_em_permute=*/true,
                 out_is_int64,
+                use_topk_idx,
                 sp,
                 dynamic_smem_bytes,
                 stream);
@@ -623,6 +686,7 @@ ncclResult_t call_metadata_preprocessing(
         per_expert_token_counts != nullptr,
         /*enable_em_permute=*/false,
         out_is_int64,
+        /*use_topk_idx=*/false,
         sp,
         dynamic_smem_bytes,
         stream);
@@ -1642,6 +1706,103 @@ void launch_dispatch_permute(
     ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, recipe, stream);
 }
 
+// Standalone intra-LSA head/tail sync kernels for the unfused-sync path. A single
+// block's warp runs the same cross-rank LSA barrier the fused kernels do; the
+// kernel boundary provides the whole-grid ordering the fused grid flag gave.
+__global__ void lsa_head_sync_kernel(ncclDevComm_t* dcomms, uint32_t* head_sync_flag) {
+    ::ht_ep::lsa_grid_head_gate(dcomms, head_sync_flag);
+}
+__global__ void lsa_tail_sync_kernel(
+    ncclDevComm_t* dcomms, uint32_t* grid_barrier_counter, uint32_t* head_sync_flag) {
+    ::ht_ep::lsa_grid_tail_barrier(dcomms, grid_barrier_counter, head_sync_flag);
+}
+
+ncclResult_t launch_dispatch_pull(
+    void* recv_x_em,
+    float* recv_topk_weights_em,
+    void* recv_x_scale_em,
+    const int32_t* flat2em_slot_map,
+    const int32_t* srcpos_map,
+    const int32_t* recv_slot_to_src,
+    const void* const* peer_input_ptrs,
+    const float* const* peer_weight_ptrs,
+    const void* const* peer_scale_ptrs,
+    const int32_t* num_recv_tokens_dev,
+    const int64_t* expert_token_offsets,
+    const int32_t* per_expert_counts_active,
+    int top_k,
+    int experts_per_rank,
+    int row_bytes,
+    int scale_row_bytes,
+    int caller_num_recv_tokens,
+    int tokens_per_rank,
+    int lsa_team_size,
+    int sm_count,
+    unsigned int shuffle_sms,
+    ncclEpDispQuant_t recipe,
+    ncclDevComm_t* dcomms,
+    uint32_t* head_sync_flag,
+    uint32_t* grid_barrier_counter,
+    cudaStream_t stream,
+    bool unfused_sync) {
+    assert(experts_per_rank > 0 && experts_per_rank <= ::ht_ep::kLocalPermuteMaxExpertsPerRank);
+    assert(row_bytes > 0 && (row_bytes % 16) == 0);
+    assert(top_k > 0);
+    assert(sm_count > 0);
+    assert(tokens_per_rank > 0 && lsa_team_size > 0);
+    assert((recv_topk_weights_em == nullptr) == (peer_weight_ptrs == nullptr));
+    const bool fwd = recipe == NCCL_EP_DISP_QUANT_FWD;
+    // Couple scale operands to scale_row_bytes: a zero-recv (eager) fwd rank relocates no rows.
+    assert(scale_row_bytes >= 0 && (scale_row_bytes % 16) == 0);
+    assert((scale_row_bytes > 0) == (recv_x_scale_em != nullptr && peer_scale_ptrs != nullptr));
+
+    const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
+
+    ::ht_ep::dispatch_pull_param_t p{};
+    p.recv_x_em = recv_x_em;
+    p.recv_topk_weights_em = recv_topk_weights_em;
+    p.recv_x_scale_em = fwd ? static_cast<uint8_t*>(recv_x_scale_em) : nullptr;
+    p.flat2em_slot_map = flat2em_slot_map;
+    p.srcpos_map = srcpos_map;
+    p.recv_slot_to_src = recv_slot_to_src;
+    assert(lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
+    for (int i = 0; i < lsa_team_size; i++) {
+        p.peer_input_ptrs[i] = peer_input_ptrs[i];
+        if (peer_weight_ptrs != nullptr) p.peer_weight_ptrs[i] = peer_weight_ptrs[i];
+        if (peer_scale_ptrs != nullptr) p.peer_scale_ptrs[i] = peer_scale_ptrs[i];
+    }
+    p.num_recv_tokens_dev = num_recv_tokens_dev;
+    p.expert_token_offsets = expert_token_offsets;
+    p.per_expert_counts_active = per_expert_counts_active;
+    p.top_k = top_k;
+    p.experts_per_rank = experts_per_rank;
+    p.row_bytes = row_bytes;
+    p.scale_row_bytes = fwd ? scale_row_bytes : 0;
+    p.caller_num_recv_tokens = caller_num_recv_tokens;
+    p.tokens_per_rank = tokens_per_rank;
+    p.lsa_team_size = lsa_team_size;
+    p.dcomms = dcomms;
+    p.head_sync_flag = head_sync_flag;
+    p.grid_barrier_counter = grid_barrier_counter;
+    p.unfused_sync = unfused_sync;
+
+    if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomms, head_sync_flag);
+    const ncclResult_t status = ::nccl_ep::ht::jit::launch_dispatch_pull(static_cast<int>(grid), p, recipe, stream);
+    if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
+    if (unfused_sync)
+        lsa_tail_sync_kernel<<<1, 32, 0, stream>>>(dcomms, grid_barrier_counter, head_sync_flag);
+    return ncclSuccess;
+}
+
+size_t dispatch_pull_smem_bytes(int hidden_int4) {
+    return static_cast<size_t>(::nccl_ep::ht::jit::pull_smem_bytes_per_warp(hidden_int4) +
+                               ::nccl_ep::ht::jit::pull_static_smem_bytes_per_warp());
+}
+
+size_t comb_stage_stride_bytes(int row_bytes, bool reserve_prob) {
+    return static_cast<size_t>(::ht_ep::comb_stage_stride_bytes(row_bytes, reserve_prob));
+}
+
 void launch_combine_reduce(
     void* flat_staging,
     const void* recv_x_em,
@@ -1681,6 +1842,114 @@ void launch_combine_reduce(
         p,
         stream,
         token_dtype);
+}
+
+ncclResult_t launch_combine_push(
+    void* const* peer_staging_ptrs,
+    const void* recv_x_em,
+    const int32_t* flat2em_slot_map,
+    const int32_t* recv_slot_to_src,
+    const int32_t* num_recv_tokens_dev,
+    ncclDevComm_t* dcomms,
+    uint32_t* head_sync_flag,
+    uint32_t* grid_barrier_counter,
+    int top_k,
+    int row_bytes,
+    int caller_num_recv_tokens,
+    int my_lsa_rank,
+    int tokens_per_rank,
+    int lsa_team_size,
+    int sm_count,
+    unsigned int shuffle_sms,
+    cudaStream_t stream,
+    ncclDataType_t token_dtype,
+    const float* topk_weights_em,
+    const int32_t* srcpos_map,
+    bool backward,
+    bool unfused_sync) {
+    assert(row_bytes > 0 && (row_bytes % 16) == 0);
+    assert(top_k > 0);
+    assert(sm_count > 0);
+    assert(tokens_per_rank > 0 && lsa_team_size > 0);
+    assert(my_lsa_rank >= 0 && my_lsa_rank < lsa_team_size);
+    // A zero-recv rank (eager mode) pushes nothing but must still launch to
+    // participate in the head-gate and tail-barrier sync; its empty EM input
+    // weights are null, so only require topk_weights_em when it has recv tokens.
+    assert(!backward || (srcpos_map != nullptr &&
+                         (topk_weights_em != nullptr || caller_num_recv_tokens == 0)));
+
+    const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
+
+    ::ht_ep::combine_push_param_t p{};
+    assert(lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
+    for (int i = 0; i < lsa_team_size; i++) {
+        p.peer_staging_ptrs[i] = peer_staging_ptrs[i];
+    }
+    p.recv_x_em = recv_x_em;
+    p.flat2em_slot_map = flat2em_slot_map;
+    p.recv_slot_to_src = recv_slot_to_src;
+    p.num_recv_tokens_dev = num_recv_tokens_dev;
+    p.dcomms = dcomms;
+    p.head_sync_flag = head_sync_flag;
+    p.grid_barrier_counter = grid_barrier_counter;
+    p.top_k = top_k;
+    p.row_bytes = row_bytes;
+    p.caller_num_recv_tokens = caller_num_recv_tokens;
+    p.my_lsa_rank = my_lsa_rank;
+    p.tokens_per_rank = tokens_per_rank;
+    p.lsa_team_size = lsa_team_size;
+    p.topk_weights_em = topk_weights_em;
+    p.srcpos_map = srcpos_map;
+    p.unfused_sync = unfused_sync;
+
+    if (unfused_sync) lsa_head_sync_kernel<<<1, 32, 0, stream>>>(dcomms, head_sync_flag);
+    const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
+        top_k, row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward);
+    if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
+    if (unfused_sync)
+        lsa_tail_sync_kernel<<<1, 32, 0, stream>>>(dcomms, grid_barrier_counter, head_sync_flag);
+    return ncclSuccess;
+}
+
+ncclResult_t launch_combine_reduce_stage(
+    void* attn_output,
+    const void* staging,
+    const uint16_t* topk_idx,
+    int num_topk,
+    int experts_per_rank,
+    int experts_per_lsa_team,
+    int num_combined_tokens,
+    int lsa_team_size,
+    int row_bytes,
+    int sm_count,
+    unsigned int shuffle_sms,
+    cudaStream_t stream,
+    ncclDataType_t token_dtype,
+    float* combined_topk_weights,
+    int top_k,
+    bool backward) {
+    assert(row_bytes > 0 && (row_bytes % 16) == 0);
+    assert(sm_count > 0);
+    assert(lsa_team_size > 0);
+    assert(!backward || (combined_topk_weights != nullptr && top_k > 0));
+
+    const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
+
+    ::ht_ep::combine_reduce_param_t p{};
+    p.attn_output = attn_output;
+    p.staging = staging;
+    p.topk_idx = topk_idx;
+    p.num_topk = num_topk;
+    p.experts_per_rank = experts_per_rank;
+    p.experts_per_lsa_team = experts_per_lsa_team;
+    p.num_combined_tokens = num_combined_tokens;
+    p.lsa_team_size = lsa_team_size;
+    p.row_bytes = row_bytes;
+    p.combined_topk_weights = combined_topk_weights;
+    p.top_k = top_k;
+
+    return ::nccl_ep::ht::jit::launch_combine_reduce_stage(
+        row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward);
 }
 
 } // namespace ht

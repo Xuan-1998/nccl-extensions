@@ -22,12 +22,27 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
 
 #define NCCL_ASSERT(x) ASSERT_EQ((x), ncclSuccess)
 #define CUDA_ASSERT(x) ASSERT_EQ((x), cudaSuccess)
+
+// True when HT EM pull-dispatch/push-combine mode is active (NCCL_EP_HT_EM_PULL_PUSH).
+// The mode only supports the expert-major layout, so FLAT / rank-major cases skip.
+static inline bool ht_em_pull_push_active() {
+    const char* v = getenv("NCCL_EP_HT_EM_PULL_PUSH");
+    return v && v[0] != '\0' && v[0] != '0';
+}
+
+// Skip the current test under NCCL_EP_HT_EM_PULL_PUSH, which supports expert-major only.
+#define SKIP_IF_PULL_PUSH()                                                              \
+    do {                                                                                \
+        if (ht_em_pull_push_active())                                                   \
+            GTEST_SKIP() << "NCCL_EP_HT_EM_PULL_PUSH supports expert-major layout only"; \
+    } while (0)
 
 // Allocate a tensor descriptor and bind it to a caller-owned device buffer.
 template <typename... Dims>

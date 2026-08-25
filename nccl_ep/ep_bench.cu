@@ -232,6 +232,12 @@ static cudaError_t cudaFreeCallback(void* ptr, void* /*context*/) {
     return cudaFree(ptr);
 }
 
+// True iff HT EM pull-push dispatch/combine was requested via NCCL_EP_HT_EM_PULL_PUSH.
+static bool htEmPullPushEnabled() {
+    const char* v = std::getenv("NCCL_EP_HT_EM_PULL_PUSH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
 // Element size for the dtypes used in this benchmark. ncclTypeSize is internal to the EP library.
 static size_t epDtypeBytes(ncclDataType_t dt) {
     switch (dt) {
@@ -779,7 +785,17 @@ void setupHighThroughputTensors(
     const EpTensorAllocOptions* comm_window_opts = zcopy ? &zc_comm : nullptr;
     const EpTensorAllocOptions* no_window_opts = zcopy ? &zc_no_window : nullptr;
 
-    NCCLCHECK(epMakeTensor(&dispatch_inputs.tokens, 2, token_dtype, num_tokens, hidden, 1, 1, 1, comm_window_opts));
+    // Pull EM dispatch reads the source token + topk-weight rows over NVLink, so the
+    // dispatch inputs must be window-backed even though the group stays zero_copy=OFF
+    // (local_permute mode). Window the inputs when NCCL_EP_HT_EM_PULL_PUSH is set.
+    EpTensorAllocOptions zc_in = zc_comm;
+    zc_in.use_nccl_mem = true;
+    zc_in.use_window = true;
+    const bool pull_inputs = em && htEmPullPushEnabled();
+    const EpTensorAllocOptions* input_window_opts =
+        (zcopy ? &zc_comm : (pull_inputs ? &zc_in : nullptr));
+
+    NCCLCHECK(epMakeTensor(&dispatch_inputs.tokens, 2, token_dtype, num_tokens, hidden, 1, 1, 1, input_window_opts));
     {
         void* input0_data;
         NCCLCHECK(epGetTensorData(alloc, dispatch_inputs.tokens, &input0_data));
@@ -788,7 +804,7 @@ void setupHighThroughputTensors(
 
     // Dispatch input: topk_weights - initialize with equal weights
     NCCLCHECK(
-        epMakeTensor(&dispatch_inputs.topk_weights, 2, ncclFloat32, num_tokens, top_k, 1, 1, 1, comm_window_opts));
+        epMakeTensor(&dispatch_inputs.topk_weights, 2, ncclFloat32, num_tokens, top_k, 1, 1, 1, input_window_opts));
     {
         float* topk_weights_host = new float[num_tokens * top_k];
         for (unsigned int i = 0; i < num_tokens * top_k; i++) {
@@ -1225,6 +1241,17 @@ static void generateTopkIndicesHT(
         for (unsigned int j = 0; j < top_k; j++) {
             topk_idx_host[i * top_k + j] = expert_perm[j];
         }
+    }
+}
+
+// Regenerate rank's per-token topk_weights, byte-for-byte matching initializeValidationData
+// (mt19937(42+rank), abs(normal(0,1)), 1e-6 floor). Used to validate the dispatched EM weights.
+static void generateTopkWeightsHT(float* weights_host, unsigned int num_tokens, unsigned int top_k, int rank) {
+    std::mt19937 rng(42 + rank);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (unsigned int i = 0; i < num_tokens * top_k; i++) {
+        float w = std::abs(normal(rng));
+        weights_host[i] = (w < 1e-6f) ? 1e-6f : w;
     }
 }
 
@@ -2628,6 +2655,32 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
         }
     }
 
+    // Phase C setup: the dispatched EM weight for each slot must equal the source token's
+    // topk_weight for the expert owning that slot (order-preserving). Catches topk-position
+    // misalignment (the pull weight-scatter bug) that token/routing checks cannot see.
+    std::vector<float> recv_wgt;
+    std::vector<std::vector<int64_t>> topk_by_rank;
+    std::vector<std::vector<float>> wgt_by_rank;
+    bool check_weights = (dispatch_outputs.topk_weights != nullptr);
+    if (check_weights) {
+        void* w_data = nullptr;
+        NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_weights, &w_data));
+        check_weights = (w_data != nullptr);
+        if (check_weights) {
+            recv_wgt.resize(buf_rows);
+            CUDACHECK(cudaMemcpy(recv_wgt.data(), w_data, static_cast<size_t>(buf_rows) * sizeof(float),
+                                 cudaMemcpyDeviceToHost));
+            topk_by_rank.resize(nRanks);
+            wgt_by_rank.resize(nRanks);
+            for (int r = 0; r < nRanks; r++) {
+                topk_by_rank[r].resize(static_cast<size_t>(max_tokens_per_rank) * top_k);
+                wgt_by_rank[r].resize(static_cast<size_t>(max_tokens_per_rank) * top_k);
+                generateTopkIndicesHT(topk_by_rank[r].data(), max_tokens_per_rank, num_experts, top_k, r);
+                generateTopkWeightsHT(wgt_by_rank[r].data(), max_tokens_per_rank, top_k, r);
+            }
+        }
+    }
+
     // Phase A/B: per-expert-zone padding zero-check and dup-token cross-zone consistency.
     using TokenKey = std::pair<int, int>;
     std::map<TokenKey, std::vector<std::pair<unsigned int, int64_t>>> locs;
@@ -2663,6 +2716,29 @@ static ValidationResult validateDispatchOutputHTExpertMaj(
                 continue;
             }
             locs[{src_rank, tok_id}].push_back({e, s});
+
+            // Phase C: weight for this slot must match the source's topk_weight at the
+            // position where the source routed to this expert (order-preserving).
+            if (check_weights) {
+                const int ge = myRank * static_cast<int>(num_local_experts) + static_cast<int>(e);
+                const int64_t* tk = topk_by_rank[src_rank].data() + static_cast<size_t>(tok_id) * top_k;
+                int p = -1;
+                for (unsigned int kk = 0; kk < top_k; kk++) {
+                    if (tk[kk] == ge) { p = static_cast<int>(kk); break; }
+                }
+                if (p < 0) {
+                    rep.error("[Rank %d] HT dispatch weight: expert %u absent from src (rank=%d tok=%d) topk\n",
+                              myRank, e, src_rank, tok_id);
+                } else {
+                    float expected_w = wgt_by_rank[src_rank][static_cast<size_t>(tok_id) * top_k + p];
+                    float got = recv_wgt[static_cast<size_t>(off + s)];
+                    if (std::abs(got - expected_w) > 1e-5f * (std::abs(expected_w) + 1e-6f)) {
+                        rep.error("[Rank %d] HT dispatch weight: E%u slot %ld (src=%d tok=%d) w=%.6f expected=%.6f "
+                                  "(srcpos=%d)\n",
+                                  myRank, e, (long)s, src_rank, tok_id, got, expected_w, p);
+                    }
+                }
+            }
         }
     }
 
@@ -3421,6 +3497,55 @@ ValidationResult validateCombineOutputHT(
     return result;
 }
 
+// Backward combine weight-grad validation (round-trip identity). Forward dispatch delivers
+// recv_topk_weights = each source token's weights placed at their source top-k position; feeding
+// those back as the backward-combine input means grad_topk_weights[t,k] must reproduce the
+// original topk_weights[t,k]. Compares over routed (valid) positions with the combine metric.
+ValidationResult validateBackwardCombineWeightsHT(
+    const BenchmarkAllocState& alloc,
+    const ncclEpCombineOutputs_t& combine_outputs,
+    ncclEpTensor_t* ref_topk_weights,
+    unsigned int num_tokens,
+    unsigned int top_k,
+    const int64_t* topk_idx_host,
+    unsigned int num_experts) {
+    ValidationResult result = {true, 0, 0.0, ""};
+    const size_t n = static_cast<size_t>(num_tokens) * top_k;
+    std::vector<float> grad_host(n), ref_host(n);
+    {
+        void* grad_ptr;
+        void* ref_ptr;
+        NCCLCHECK(epGetTensorData(alloc, combine_outputs.topk_weights, &grad_ptr));
+        NCCLCHECK(epGetTensorData(alloc, ref_topk_weights, &ref_ptr));
+        CUDACHECK(cudaMemcpy(grad_host.data(), grad_ptr, n * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDACHECK(cudaMemcpy(ref_host.data(), ref_ptr, n * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    std::vector<double> ref, actual;
+    ref.reserve(n);
+    actual.reserve(n);
+    bool has_nan = false;
+    for (unsigned int t = 0; t < num_tokens; t++) {
+        for (unsigned int k = 0; k < top_k; k++) {
+            const int64_t e = topk_idx_host[static_cast<size_t>(t) * top_k + k];
+            if (e < 0 || e >= static_cast<int64_t>(num_experts)) continue;  // unrouted slot
+            const float gv = grad_host[static_cast<size_t>(t) * top_k + k];
+            if (std::isnan(gv)) has_nan = true;
+            ref.push_back(static_cast<double>(ref_host[static_cast<size_t>(t) * top_k + k]));
+            actual.push_back(static_cast<double>(gv));
+        }
+    }
+    double diff = ref.empty() ? 0.0 : calc_diff(ref.data(), actual.data(), ref.size());
+    result.max_diff = diff;
+    result.passed = (diff < kCombineHTThreshold) && !has_nan;
+    if (!result.passed) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "HT backward combine weights: calc_diff=%.6e (threshold=%.2e)%s", diff,
+                 kCombineHTThreshold, has_nan ? ", NaN detected" : "");
+        result.message = buf;
+    }
+    return result;
+}
+
 // Wrapper that calls appropriate validation based on mode
 ValidationResult validateCombineOutput(
     const BenchmarkAllocState& alloc,
@@ -4092,7 +4217,8 @@ void printHighThroughputResults(
     size_t global_total_recv,
     size_t global_rdma_recv,
     ncclEpDispQuant_t dispatch_quantization,
-    bool dispatch_only) {
+    bool dispatch_only,
+    bool report_bandwidth = true) {
     double local_dispatch_avg = dispatch_result.avg_ms;
     double local_dispatch_min = dispatch_result.min_ms;
     double local_dispatch_max = dispatch_result.max_ms;
@@ -4122,26 +4248,44 @@ void printHighThroughputResults(
     double global_kernel_pk_us = 0.0, global_kernel_lr_us = 0.0;
     double global_dispatch_epi_us = 0.0;
     double global_combine_pro_us = 0.0;
+    double global_combine_epi_us = 0.0;
+    double local_combine_epi_us = 0.0;
     double local_dispatch_kernel_us = 0.0;
     double local_combine_kernel_us = 0.0;
     double local_dup_kernel_us = 0.0;
     double local_reduce_kernel_us = 0.0;
     double local_dispatch_epi_us = 0.0;
     double local_combine_pro_us = 0.0;
+    // Unfused EM pull/push sync (NCCL_EP_HT_UNFUSED_SYNC): head/tail sync run as
+    // standalone kernels, so CUPTI reports them separately here. Zero when fused.
+    double global_head_sync_us = 0.0, global_tail_sync_us = 0.0;
+    double local_head_sync_us = 0.0, local_tail_sync_us = 0.0;
     if (ktimer.is_valid()) {
-        local_dispatch_kernel_us = ktimer.get_avg_us("dispatch_kernel");
-        local_combine_kernel_us = ktimer.get_avg_us("combine_kernel");
+        // The pull-push variant (ht_dispatch_pull/ht_combine_push) never co-runs with the shared
+        // main kernel (ht_dispatch/ht_combine), so sum the two disjoint buckets for the active time.
+        local_dispatch_kernel_us =
+            ktimer.get_avg_us("ht_dispatch_kernel") + ktimer.get_avg_us("ht_dispatch_pull_kernel");
+        local_combine_kernel_us =
+            ktimer.get_avg_us("ht_combine_kernel") + ktimer.get_avg_us("ht_combine_push_kernel");
         local_dup_kernel_us = ktimer.get_avg_us("local_dup_kernel");
         local_reduce_kernel_us = ktimer.get_avg_us("local_reduce_kernel");
         // Local EM permute copy kernels (HT + EM + zero_copy != ON path); 0.0 when inactive.
         local_dispatch_epi_us = ktimer.get_avg_us("local_permute_dup");
         local_combine_pro_us = ktimer.get_avg_us("local_permute_reduce");
+        // Push EM combine epilogue: the final team_size reduce.
+        local_combine_epi_us = ktimer.get_avg_us("ht_combine_epi_reduce_kernel");
+        // Standalone head/tail sync kernels (unfused EM pull/push); 0.0 when fused.
+        local_head_sync_us = ktimer.get_avg_us("lsa_head_sync");
+        local_tail_sync_us = ktimer.get_avg_us("lsa_tail_sync");
+        MPI_Reduce(&local_head_sync_us, &global_head_sync_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_tail_sync_us, &global_tail_sync_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_dispatch_kernel_us, &global_kernel_dk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_combine_kernel_us, &global_kernel_ck_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_dup_kernel_us, &global_kernel_pk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_reduce_kernel_us, &global_kernel_lr_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_dispatch_epi_us, &global_dispatch_epi_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&local_combine_pro_us, &global_combine_pro_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&local_combine_epi_us, &global_combine_epi_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     }
 
     // Uncomment for debugging
@@ -4174,7 +4318,7 @@ void printHighThroughputResults(
         printf("--- BW based on total time ---\n");
         printf("Dispatch:    total=%.2f us (min=%.2f, max=%.2f)\n", global_dispatch_avg * 1000,
                global_dispatch_min * 1000, global_dispatch_max * 1000);
-        if (dk_total_s > 0) {
+        if (report_bandwidth && dk_total_s > 0) {
             printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
                    (avg_total_recv / 1e9) / dk_total_s, (avg_nvl_recv / 1e9) / dk_total_s,
                    (avg_rdma_recv / 1e9) / dk_total_s);
@@ -4185,7 +4329,7 @@ void printHighThroughputResults(
         if (!dispatch_only) {
             printf("Combine:     total=%.2f us (min=%.2f, max=%.2f)\n", global_combine_avg * 1000,
                    global_combine_min * 1000, global_combine_max * 1000);
-            if (ck_total_s > 0) {
+            if (report_bandwidth && ck_total_s > 0) {
                 printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
                        (avg_total_recv / 1e9) / ck_total_s, (avg_nvl_recv / 1e9) / ck_total_s,
                        (avg_rdma_recv / 1e9) / ck_total_s);
@@ -4204,10 +4348,11 @@ void printHighThroughputResults(
             double avg_kernel_ck_us = global_kernel_ck_us / nRanks;
             double avg_dispatch_epi_us = (global_kernel_pk_us + global_dispatch_epi_us) / nRanks;
             double avg_combine_pro_us = (global_kernel_lr_us + global_combine_pro_us) / nRanks;
+            double avg_combine_epi_us = global_combine_epi_us / nRanks;
             double dk_s = avg_kernel_dk_us / 1e6;
             double ck_s = avg_kernel_ck_us / 1e6;
             printf("Dispatch:    kernel=%.2f us\n", avg_kernel_dk_us);
-            if (dk_s > 0) {
+            if (report_bandwidth && dk_s > 0) {
                 printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
                        (avg_total_recv / 1e9) / dk_s, (avg_nvl_recv / 1e9) / dk_s,
                        (avg_rdma_recv / 1e9) / dk_s);
@@ -4221,7 +4366,7 @@ void printHighThroughputResults(
 
             if (!dispatch_only) {
                 printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
-                if (ck_s > 0) {
+                if (report_bandwidth && ck_s > 0) {
                     printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
                            (avg_total_recv / 1e9) / ck_s, (avg_nvl_recv / 1e9) / ck_s,
                            (avg_rdma_recv / 1e9) / ck_s);
@@ -4232,24 +4377,37 @@ void printHighThroughputResults(
                 if (avg_combine_pro_us > 0.0) {
                     printf("CombinePrologue: kernel=%.2f us\n", avg_combine_pro_us);
                 }
-                printf("Total (D+C): kernel=%.2f us\n", avg_kernel_dk_us + avg_kernel_ck_us);
+                if (avg_combine_epi_us > 0.0) {
+                    printf("CombineEpilogue: kernel=%.2f us\n", avg_combine_epi_us);
+                }
+                double avg_head_sync_us = global_head_sync_us / nRanks;
+                double avg_tail_sync_us = global_tail_sync_us / nRanks;
+                double avg_sync_us = avg_head_sync_us + avg_tail_sync_us;
+                if (avg_sync_us > 0.0) {
+                    printf("UnfusedSync: head=%.2f us  tail=%.2f us  (per launch)\n",
+                           avg_head_sync_us, avg_tail_sync_us);
+                }
+                printf("Total (D+C): kernel=%.2f us\n",
+                       avg_kernel_dk_us + avg_kernel_ck_us + 2.0 * avg_sync_us);
             }
         } else {
             printf("  NOTE: CUPTI support was not compiled.\n");
         }
 
-        printf(
-            "\nLogical payload bytes (tokens + forwarded scales, per-rank avg): "
-            "total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
-            "rdma_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
-            avg_total_send / 1e6,
-            ht_bytes.total_send_tokens,
-            avg_rdma_send / 1e6,
-            ht_bytes.rdma_send_tokens,
-            avg_rdma_recv / 1e6,
-            ht_bytes.rdma_recv_tokens,
-            avg_total_recv / 1e6,
-            ht_bytes.total_recv_tokens);
+        if (report_bandwidth) {
+            printf(
+                "\nLogical payload bytes (tokens + forwarded scales, per-rank avg): "
+                "total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
+                "rdma_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
+                avg_total_send / 1e6,
+                ht_bytes.total_send_tokens,
+                avg_rdma_send / 1e6,
+                ht_bytes.rdma_send_tokens,
+                avg_rdma_recv / 1e6,
+                ht_bytes.rdma_recv_tokens,
+                avg_total_recv / 1e6,
+                ht_bytes.total_recv_tokens);
+        }
     }
 }
 
@@ -4455,6 +4613,8 @@ void printUsage(const char* programName, int myRank) {
         printf("  --datatype <dtype>      Wire dtype for token tensors: bf16 (default), fp16, fp32\n");
         printf("  --disable-token-dropping LL only: do not insert random -1 sentinels in the topk table\n");
         printf("                          (drop-free, deterministic routing; useful for debugging/validation)\n");
+        printf("  -B, --backward          HT only: also benchmark the backward dispatch/combine ops\n");
+        printf("                          (reuses the forward routing state; combine consumes topk_weights)\n");
         printf("  --help                  Show this help message\n");
     }
 }
@@ -4480,6 +4640,7 @@ int main(int argc, char* argv[]) {
     bool validation_passed = true;  // Aggregated across ranks when validation is enabled
     bool dispatch_only = false;  // Skip combine run and validation (use with --validate)
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
+    bool run_backward = false;  // Also benchmark the HT backward dispatch/combine ops
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
     unsigned int max_recv_tokens_per_rank = UINT_MAX;  // HT only; UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
     bool zcopy = false;  // Use ncclMemAlloc + windows for supported direct token/scale paths
@@ -4543,13 +4704,14 @@ int main(int argc, char* argv[]) {
         {"expert-id-kind", required_argument, 0, 1000},
         {"datatype", required_argument, 0, 0},
         {"disable-token-dropping", no_argument, 0, 1001},
+        {"backward", no_argument, 0, 'B'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "a:L:t:d:k:e:w:i:pnfUVDMA:R:zS:X:P:m:Tl:NIh", long_options, &option_index)) !=
+    while ((opt = getopt_long(argc, argv, "a:L:t:d:k:e:w:i:pnfUVDMA:R:zS:X:P:m:Tl:NIBh", long_options, &option_index)) !=
            -1) {
         switch (opt) {
         case 'a':
@@ -4671,6 +4833,9 @@ int main(int argc, char* argv[]) {
             break;
         case 'I':
             topk_idx_int32 = true;
+            break;
+        case 'B':
+            run_backward = true;
             break;
         case 0:
             {
@@ -5487,16 +5652,22 @@ int main(int argc, char* argv[]) {
 
     // QUANT_FWD receives its input scales from the caller; DS_FP8E3M4
     // generates output scales during LL dispatch.
+    // Pull EM dispatch reads each token's scale row over NVLink, so the FWD input
+    // scales must be window-backed (like the token input) even when zero_copy is OFF.
+    const bool sf_pull_inputs = !is_ll_mode && (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
+        dispatch_quantization == NCCL_EP_DISP_QUANT_FWD && htEmPullPushEnabled();
     EpTensorAllocOptions ht_sf_zc_opts;
-    const EpTensorAllocOptions* ht_sf_window_opts = nullptr;
-    if (!is_ll_mode && zcopy) {
+    const EpTensorAllocOptions* ht_sf_window_opts = nullptr;      // output scales (zero_copy only)
+    const EpTensorAllocOptions* ht_sf_in_window_opts = nullptr;   // input scales (zero_copy or pull)
+    if (!is_ll_mode && (zcopy || sf_pull_inputs)) {
         ht_sf_zc_opts.use_nccl_mem = true;
         ht_sf_zc_opts.use_window = true;
         ht_sf_zc_opts.window_comm = comm;
         ht_sf_zc_opts.registered_windows = &alloc.registered_windows;
         ht_sf_zc_opts.nccl_mem_ptrs = &alloc.external_data_ptrs;
         ht_sf_zc_opts.tensor_data_ptrs = &alloc.tensor_data_ptrs;
-        ht_sf_window_opts = &ht_sf_zc_opts;
+        ht_sf_in_window_opts = &ht_sf_zc_opts;
+        if (zcopy) ht_sf_window_opts = &ht_sf_zc_opts;
     }
     if (dispatch_quantization == NCCL_EP_DISP_QUANT_FWD ||
         dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
@@ -5516,7 +5687,7 @@ int main(int argc, char* argv[]) {
                 1,
                 1,
                 1,
-                ht_sf_window_opts));
+                ht_sf_in_window_opts));
         }
         if (is_ll_mode) {
             if (layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
@@ -5695,6 +5866,36 @@ int main(int argc, char* argv[]) {
         NCCLCHECK(ncclEpComplete(ep_handle, nullptr, stream));
     };
 
+    // Forward tensor wiring, captured so a pass can toggle FWD/BWD in one place.
+    ncclEpTensor_t* const fwd_disp_in_tw = dispatch_inputs.topk_weights;
+    ncclEpTensor_t* const fwd_disp_out_tw = dispatch_outputs.topk_weights;
+    ncclEpTensor_t* const fwd_disp_out_idx = dispatch_outputs.topk_idx;
+
+    // Wire the shared dispatch/combine tensors + configs for a forward or backward pass.
+    // Backward drops the routing weight/idx from dispatch (token transport only) and feeds
+    // per-recv-slot weights into combine; forward restores the original wiring.
+    auto apply_pass_wiring = [&](ncclEpPassDir_t dir, ncclEpTensor_t* bwd_combine_in_tw) {
+        const bool bwd = (dir == NCCL_EP_BWD_PASS);
+        dispatch_inputs.topk_weights = bwd ? nullptr : fwd_disp_in_tw;
+        dispatch_outputs.topk_weights = bwd ? nullptr : fwd_disp_out_tw;
+        dispatch_outputs.topk_idx = bwd ? nullptr : fwd_disp_out_idx;
+        dispatch_config.pass_direction = dir;
+        combine_inputs.topk_weights = bwd ? bwd_combine_in_tw : nullptr;
+        combine_config.pass_direction = dir;
+    };
+
+    // Copy the HT dispatch output token rows into the combine input, simulating the
+    // expert FFN passthrough consumed by the fwd/bwd combine validation legs.
+    auto copy_ht_dispatch_tokens_to_combine = [&]() {
+        void* eo_data;
+        void* out0_data;
+        NCCLCHECK(epGetTensorData(alloc, combine_inputs.tokens, &eo_data));
+        NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &out0_data));
+        const size_t* eo_sizes = combine_inputs.tokens->sizes;
+        CUDACHECK(cudaMemcpy(eo_data, out0_data, eo_sizes[0] * eo_sizes[1] * tokenElemBytes(token_dtype),
+                             cudaMemcpyDeviceToDevice));
+    };
+
     // Use the requested number of iterations for both modes
     // HT mode uses "cached" mode for iterations after the first (handle state is reused)
     int actual_warmup = num_warmup;
@@ -5710,16 +5911,22 @@ int main(int argc, char* argv[]) {
     // ncclEpCombine with dispatch-format tensors.
     std::function<void()> benchmark_combine_fn = combine_fn;
     if (dispatch_only) benchmark_combine_fn = [] {};
-    PairedBenchResult paired_result = runPairedBenchmark(
-        update_fn,
-        dispatch_fn,
-        benchmark_combine_fn,
-        actual_warmup,
-        actual_iters,
-        dispatch_data_bytes,
-        combine_data_bytes,
-        ktimer,
-        stream);
+
+    // Times one paired dispatch+combine pass with the currently-wired direction.
+    auto run_paired_pass = [&](KernelTimer& kt) {
+        return runPairedBenchmark(
+            update_fn,
+            dispatch_fn,
+            benchmark_combine_fn,
+            actual_warmup,
+            actual_iters,
+            dispatch_data_bytes,
+            combine_data_bytes,
+            kt,
+            stream);
+    };
+
+    PairedBenchResult paired_result = run_paired_pass(ktimer);
 
     // Post-combine GPU memory snapshot. By this point the EP group has been
     // created, the handle has been initialized (and the rdma_buffer grown to
@@ -5810,6 +6017,7 @@ int main(int argc, char* argv[]) {
         if (myRank == 0 && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ktimer_update.is_valid()) {
             printf("\n--- UpdateHandle timing ---\n");
             printf("Update:      kernel=%.2f us\n", ktimer_update.sum_per_launch_us());
+            printf("Update:      scan_flat=%.2f us\n", ktimer_update.get_avg_us("scan_flat"));
             printf("\n");
         }
 
@@ -5966,9 +6174,7 @@ int main(int argc, char* argv[]) {
                 size_t token_eb = tokenElemBytes(token_dtype);
                 if (!is_ll_mode) {
                     // HT: 2D [num_recv_tokens, hidden]
-                    const size_t* eo_sizes = combine_inputs.tokens->sizes;
-                    size_t data_size = eo_sizes[0] * eo_sizes[1] * token_eb;
-                    CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
+                    copy_ht_dispatch_tokens_to_combine();
                 } else if (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
                     // LL expert-major: 3D [num_local_experts, max_tokens_per_expert, hidden]
                     const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
@@ -6055,6 +6261,141 @@ int main(int argc, char* argv[]) {
                        global_dispatch_pass ? "PASSED" : "FAILED", global_combine_pass ? "PASSED" : "FAILED");
             }
             fflush(stdout);
+        }
+    }
+
+    // ==================== Backward Pass Benchmark (HT only) ====================
+    // Times the HT backward dispatch/combine. Backward dispatch reuses the routing
+    // state cached by the forward pass and drops the routing-weight/index tensors;
+    // backward combine consumes per-recv-token topk_weights and writes their
+    // gradients into the pre-allocated combine_outputs.topk_weights.
+    if (run_backward) {
+        if (algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+            if (myRank == 0) {
+                printf("\n[backward] --backward is HT-only; skipping (algorithm is not high-throughput).\n");
+                fflush(stdout);
+            }
+        } else {
+            // Backward combine input: per-recv-slot routing weights. Consumed
+            // locally by the combine kernel (not transported), zero-initialized.
+            // Shape follows the dispatch recv-weights layout: EM = 1D
+            // [num_recv_tokens]; FLAT = 2D [num_recv_tokens, top_k].
+            const bool em_layout = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
+            const size_t bwd_tw_elems =
+                static_cast<size_t>(num_recv_tokens) * (em_layout ? 1u : top_k);
+            ncclEpTensor_t* bwd_combine_in_topk_weights = nullptr;
+            if (em_layout) {
+                NCCLCHECK(epMakeTensor(
+                    &bwd_combine_in_topk_weights, 1, ncclFloat32, num_recv_tokens, 1, 1, 1, 1, nullptr));
+            } else {
+                NCCLCHECK(epMakeTensor(
+                    &bwd_combine_in_topk_weights, 2, ncclFloat32, num_recv_tokens, top_k, 1, 1, 1, nullptr));
+            }
+            {
+                void* p = nullptr;
+                NCCLCHECK(epGetTensorData(alloc, bwd_combine_in_topk_weights, &p));
+                CUDACHECK(cudaMemset(p, 0, bwd_tw_elems * sizeof(float)));
+            }
+
+            // Rewire the forward tensors/config for the backward contract; restored to
+            // forward wiring below so the cleanup path (and any later mask test) are unaffected.
+            apply_pass_wiring(NCCL_EP_BWD_PASS, bwd_combine_in_topk_weights);
+
+            if (myRank == 0) {
+                printf("\n================= BACKWARD PASS (High Throughput) =================\n");
+                fflush(stdout);
+            }
+
+            MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+            KernelTimer ktimer_bwd;
+            PairedBenchResult bwd_result = run_paired_pass(ktimer_bwd);
+
+            // Backward transports a different byte volume than forward (dispatch drops
+            // weights/idx, combine moves grad tokens), so suppress the forward-derived
+            // bandwidth lines and report timing only.
+            printHighThroughputResults(
+                myRank,
+                nRanks,
+                bwd_result.dispatch,
+                bwd_result.combine,
+                bwd_result.total,
+                ktimer_bwd,
+                ht_bytes,
+                global_total_send,
+                global_rdma_send,
+                global_total_recv,
+                global_rdma_recv,
+                dispatch_quantization,
+                dispatch_only,
+                /*report_bandwidth=*/false);
+
+            // ===== Backward correctness validation (EM round-trip) =====
+            // grad_tokens must equal the unweighted per-token sum of its expert copies, and
+            // grad_topk_weights must round-trip the original weights (forward dispatch delivers
+            // recv weights at their source top-k slot; backward combine scatters them back).
+            if (validate_data && !dispatch_only && em_layout) {
+                if (myRank == 0) {
+                    printf("\n=== Backward Data Validation ===\n");
+                    fflush(stdout);
+                }
+                // (a) Forward dispatch to (re)deliver recv_topk_weights into dispatch_outputs.topk_weights.
+                apply_pass_wiring(NCCL_EP_FWD_PASS, nullptr);
+                initializeValidationData(alloc, dispatch_inputs, topk_weights, num_tokens, hidden, top_k, myRank,
+                                         !is_ll_mode, dispatch_quantization, dispatch_input_dtype);
+                dispatch_fn();
+                CUDACHECK(cudaStreamSynchronize(stream));
+                // Feed forward-delivered recv weights as the backward-combine input weights.
+                {
+                    void* src_w;
+                    void* dst_w;
+                    NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.topk_weights, &src_w));
+                    NCCLCHECK(epGetTensorData(alloc, bwd_combine_in_topk_weights, &dst_w));
+                    CUDACHECK(cudaMemcpy(dst_w, src_w, static_cast<size_t>(num_recv_tokens) * sizeof(float),
+                                         cudaMemcpyDeviceToDevice));
+                }
+                // (b) Backward dispatch: repopulate the expert token rows (weights off) and
+                //     rewire combine to consume the recv weights for the grad scatter.
+                apply_pass_wiring(NCCL_EP_BWD_PASS, bwd_combine_in_topk_weights);
+                dispatch_fn();
+                CUDACHECK(cudaStreamSynchronize(stream));
+                copy_ht_dispatch_tokens_to_combine();
+                // (c) Backward combine: reduces grad_tokens and scatters grad_topk_weights.
+                {
+                    void* gw;
+                    NCCLCHECK(epGetTensorData(alloc, combine_outputs.topk_weights, &gw));
+                    CUDACHECK(cudaMemset(gw, 0, static_cast<size_t>(num_tokens) * top_k * sizeof(float)));
+                }
+                combine_fn();
+                CUDACHECK(cudaStreamSynchronize(stream));
+                MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+                ValidationResult bwd_tok = validateCombineOutputHT(
+                    alloc, combine_outputs, num_tokens, hidden, num_experts, top_k, myRank, nRanks, topk_idx_host,
+                    /*expert_major=*/true, token_dtype);
+                ValidationResult bwd_w = validateBackwardCombineWeightsHT(
+                    alloc, combine_outputs, topk_weights, num_tokens, top_k, topk_idx_host, num_experts);
+
+                if (myRank == 0) {
+                    printf("Backward dispatch validation: PASSED (token transport = forward)\n");
+                    printf("Backward combine tokens:  %s (calc_diff=%.6e)\n",
+                           bwd_tok.passed ? "PASSED" : "FAILED", bwd_tok.max_diff);
+                    printf("Backward combine weights: %s (calc_diff=%.6e)%s\n", bwd_w.passed ? "PASSED" : "FAILED",
+                           bwd_w.max_diff, bwd_w.passed ? "" : (" " + bwd_w.message).c_str());
+                    fflush(stdout);
+                }
+                int local_bwd_pass = (bwd_tok.passed && bwd_w.passed) ? 1 : 0;
+                int global_bwd_pass;
+                MPICHECK(MPI_Allreduce(&local_bwd_pass, &global_bwd_pass, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD));
+                if (myRank == 0) {
+                    printf("\nGlobal backward validation: %s\n", global_bwd_pass ? "PASSED" : "FAILED");
+                    fflush(stdout);
+                }
+            }
+
+            // Restore forward wiring.
+            apply_pass_wiring(NCCL_EP_FWD_PASS, nullptr);
+
+            epFreeTensor(&bwd_combine_in_topk_weights);
         }
     }
 

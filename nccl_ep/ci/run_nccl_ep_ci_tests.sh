@@ -172,6 +172,19 @@ if [[ "${NCCL_EP_BENCH_HT:-0}" == "1" ]]; then
     --validate --dispatch-only --zcopy --dispatch-quantization scales-forward \
     --scales-forward-token-dtype fp4x2 --scales-forward-scale-dtype uint8
 
+  # EM pull dispatch + push combine (single NVLink LSA team), with the NONE (bf16
+  # dispatch + combine) and MXFP8 (fp8 tokens + E8M0 block-32 scales, dispatch-only)
+  # recipes.
+  (
+    export NCCL_EP_HT_EM_PULL_PUSH=1
+    run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+      --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 \
+      --validate
+    run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+      --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 \
+      --validate --dispatch-only --mxfp8
+  )
+
   # FOLLOW-UP: HT fp32 dispatch SMEM exceeds the device cap (~227KB on H100) at
   # hidden=7168 with the default stages/pipelines, and currently std::abort()s in
   # check_dispatch_smem_limit (device/ht_ep_adapter.cu:806). That abort should be

@@ -129,6 +129,7 @@ protected:
 // round-trip recovers the original source-side topk_weights.
 
 TEST_F(HtBwdTest, CombineWithGradRankMajor) {
+    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -234,6 +235,7 @@ TEST_F(HtBwdTest, CombineWithGradExpertMajor) {
 // values with no topk_idx; verify the recv set under the same routing.
 
 TEST_F(HtBwdTest, DispatchScatterRankMajor) {
+    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -547,11 +549,13 @@ protected:
 // CombineWithGrad + RM, top-k=2.
 // Expect: combined_topk_weights[t, k] == source-side weight w2(g_rank, t, k).
 TEST_F(HtBwdTopK2Test, CombineWithGradRankMajor) {
+    SKIP_IF_PULL_PUSH();
     run_combine_with_grad_rm(ncclInt64);
 }
 
 // Same round-trip with an int32 cached topk_idx (HT int32 support).
 TEST_F(HtBwdTopK2Test, CombineWithGradRankMajorInt32) {
+    SKIP_IF_PULL_PUSH();
     run_combine_with_grad_rm(ncclInt32);
 }
 

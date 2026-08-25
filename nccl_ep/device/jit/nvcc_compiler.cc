@@ -126,6 +126,7 @@ bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
         dup2(pipe_fd[1], STDOUT_FILENO);
         dup2(pipe_fd[1], STDERR_FILENO);
         close(pipe_fd[1]);
+
         execvp(raw_argv[0], raw_argv.data());
         _exit(127);
     }

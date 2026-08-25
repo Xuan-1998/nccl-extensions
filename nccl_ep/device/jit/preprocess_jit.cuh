@@ -33,7 +33,8 @@ inline std::string scan_flat_jit_source(
     int experts_per_rank,
     bool enable_per_expert_counts,
     bool enable_em_permute,
-    bool out_is_int64) {
+    bool out_is_int64,
+    bool use_topk_idx) {
     constexpr int rank_mask_word_bits = CHAR_BIT * static_cast<int>(sizeof(uint64_t));
     const int rank_mask_words = (lsa_team_size + rank_mask_word_bits - 1) / rank_mask_word_bits;
     // EM padded-counts / out-offsets dtype, baked as a template arg.
@@ -53,7 +54,8 @@ inline std::string scan_flat_jit_source(
         << "      " << ::nccl_ep::jit::bool_literal(enable_per_expert_counts) << ",\n"
         << "      " << ::nccl_ep::jit::bool_literal(enable_em_permute) << ",\n"
         << "      " << (enable_em_permute ? experts_per_rank : 0) << ",\n"
-        << "      " << em_out_type << ">(\n"
+        << "      " << em_out_type << ",\n"
+        << "      " << ::nccl_ep::jit::bool_literal(use_topk_idx) << ">(\n"
         << "      p.input_routing_map, p.tmp, p.sparse_to_dense_map, p.rdma_to_attn_map, p.attn_to_rdma_map,\n"
         << "      reinterpret_cast<ht_ep::rank_mask_t<" << rank_mask_words << ">*>(p.token_rank_mask),\n"
         << "      p.num_of_tokens_for_experts, p.local_expert_routing_map, p.per_expert_token_counts,\n"
@@ -64,7 +66,9 @@ inline std::string scan_flat_jit_source(
         src << ",\n"
             << "      p.expert_scan_tmp, p.flat2em_slot_map, p.em_top_k, p.em_alignment, p.em_internal_offsets,\n"
             << "      reinterpret_cast<" << em_out_type << "*>(p.em_padded_out_counts),\n"
-            << "      reinterpret_cast<" << em_out_type << "*>(p.em_out_offsets), p.em_actual_counts_out";
+            << "      reinterpret_cast<" << em_out_type << "*>(p.em_out_offsets), p.em_actual_counts_out,\n"
+            << "      p.recv_slot_to_src,\n"
+            << "      p.srcpos_map";
     }
     src << ");\n"
         << "}\n";
@@ -102,6 +106,7 @@ inline void launch_scan_flat(
     bool enable_per_expert_counts,
     bool enable_em_permute,
     bool out_is_int64,
+    bool use_topk_idx,
     ::ht_ep::scan_flat_kernel_param_t& param,
     int dynamic_smem_bytes,
     cudaStream_t stream) {
@@ -113,6 +118,7 @@ inline void launch_scan_flat(
              << num_of_blocks << (enable_per_expert_counts ? "_pec" : "_nopec") << (enable_em_permute ? "_em" : "_noem");
         // EM out dtype is baked into the variant, so it's part of the cache key.
         if (enable_em_permute) name << "_epr" << experts_per_rank << (out_is_int64 ? "_i64" : "_i32");
+        if (use_topk_idx) name << "_tkidx";
         return name.str();
     }();
     const std::string source = scan_flat_jit_source(
@@ -123,7 +129,8 @@ inline void launch_scan_flat(
         experts_per_rank,
         enable_per_expert_counts,
         enable_em_permute,
-        out_is_int64);
+        out_is_int64,
+        use_topk_idx);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_scan_flat";

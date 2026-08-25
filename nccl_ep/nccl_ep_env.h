@@ -52,6 +52,10 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar debug{"NCCL_EP_DEBUG", ncclEpEnvType::flag};
     ncclEpEnvVar ht_em_local_dup{"NCCL_EP_HT_EM_LOCAL_DUP", ncclEpEnvType::flag};
     ncclEpEnvVar ht_em_nvlink_dup{"NCCL_EP_HT_EM_NVLINK_DUP", ncclEpEnvType::flag};
+    ncclEpEnvVar ht_em_pull_push{"NCCL_EP_HT_EM_PULL_PUSH", ncclEpEnvType::flag};
+    // Launch the intra-LSA head and tail sync as separate kernels instead of
+    // fusing them into the dispatch/combine kernels. Pull-push only.
+    ncclEpEnvVar ht_unfused_sync{"NCCL_EP_HT_UNFUSED_SYNC", ncclEpEnvType::flag};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};

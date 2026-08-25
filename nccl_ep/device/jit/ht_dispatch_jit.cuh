@@ -13,6 +13,7 @@
 #include "device/jit/jit_source_literals.hpp"
 #include "nccl_ep_env.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdint>
@@ -419,6 +420,15 @@ inline int pick_dup_blocks_per_sm(int hidden_int4) {
     return (hidden_int4 <= 256) ? 2 : 1;
 }
 
+// Pull dispatch blocks/SM. Decoupled from pick_dup_blocks_per_sm (different reason): pull is
+// bound by in-flight TMAs per SM (one per pull warp). At small hidden the pull-warp count hits
+// the kPullDispatchMaxPullWarps cap below what smem allows, so a 2nd CTA doubles the rows in
+// flight and the tiny rows need it to fill NVLink (measured ~29% faster at h=3072 MXFP8). At
+// large hidden smem caps the warps and 24 big rows already saturate, so 1 CTA wins.
+inline int pick_pull_blocks_per_sm(int hidden_int4) {
+    return (hidden_int4 <= 256) ? 2 : 1;
+}
+
 inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec, int blocks_per_sm,
                                                 ncclEpDispQuant_t recipe) {
     std::ostringstream src;
@@ -492,6 +502,176 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
                      error.empty() ? "" : error.c_str());
         std::abort();
     }
+}
+
+// ============================ Pull EM dispatch =============================
+// Read source rows over NVLink and scatter into EM zones.
+constexpr const char* kDispatchPullJitEntryName = "nccl_ep_jit_ht_dispatch_pull_kernel";
+
+// Transfer policy: TMA (cp.async.bulk) read into a per-warp smem row + TMA store to each EM slot.
+inline std::string pull_stage_literal(int hidden_int4) {
+    std::ostringstream t;
+    t << "::ht_ep::PullTmaStage<" << (hidden_int4 * 16) << ">";
+    return t.str();
+}
+
+// Per-pull-warp staging: token row buffer + mbarrier, plus the scale-row region when
+// the QUANT_FWD scale row is moved by TMA (scale_tma_row_bytes != 0).
+inline int pull_smem_bytes_per_warp(int hidden_int4, int scale_tma_row_bytes = 0) {
+    const int per_warp = hidden_int4 * 16 + 16; // row buffer + mbarrier
+    const int scale_per_warp = scale_tma_row_bytes ? (scale_tma_row_bytes + 16) : 0;
+    return per_warp + scale_per_warp;
+}
+
+// Static (non-dynamic) smem the pull kernel declares per pull warp: the s_active slot
+// list plus its count. It shares the device cap with the dynamic staging, so the warp
+// count has to be solved against the sum, not against the staging alone.
+inline int pull_static_smem_bytes_per_warp() {
+    return ::ht_ep::kPullDispatchMaxActive * static_cast<int>(sizeof(std::int32_t)) +
+           static_cast<int>(sizeof(int));
+}
+
+// Largest pull-warp count whose smem fits the device cap. Each warp holds one remote
+// row in flight, so more warps is strictly better until the cap. blocks_per_sm CTAs
+// must be co-resident, so each gets 1/blocks_per_sm of the cap.
+inline int pull_dispatch_warps(int hidden_int4, int scale_tma_row_bytes, size_t smem_optin,
+                               int blocks_per_sm) {
+    const int per_warp = pull_smem_bytes_per_warp(hidden_int4, scale_tma_row_bytes) +
+                         pull_static_smem_bytes_per_warp();
+    const size_t budget = smem_optin / static_cast<size_t>(std::max(1, blocks_per_sm));
+    const int fits = per_warp > 0 ? static_cast<int>(budget / static_cast<size_t>(per_warp)) : 0;
+    return std::max(1, std::min(::ht_ep::kPullDispatchMaxPullWarps, fits));
+}
+
+inline int pull_dynamic_smem_bytes(int hidden_int4, int scale_tma_row_bytes, int pull_warps) {
+    return pull_warps * pull_smem_bytes_per_warp(hidden_int4, scale_tma_row_bytes);
+}
+
+// Device opt-in shared-memory cap, queried once per device. Falls back to the 48 KB
+// architectural floor if the query fails, so a transient CUDA error degrades to a
+// smaller warp count instead of the 1-warp minimum.
+inline size_t pull_device_smem_optin() {
+    static constexpr size_t kSmemOptinFallback = 48 * 1024;
+    static thread_local int cached_dev = -1;
+    static thread_local size_t cached_cap = 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return kSmemOptinFallback;
+    if (dev != cached_dev) {
+        int cap = 0;
+        if (cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+            cap <= 0) {
+            return kSmemOptinFallback;
+        }
+        cached_cap = static_cast<size_t>(cap);
+        cached_dev = dev;
+    }
+    return cached_cap;
+}
+
+// Non-zero => move the QUANT_FWD scale row by TMA through smem instead of a register-held
+// ld/st pair. Requires a 16B-multiple row (cp.async.bulk granularity) and enough smem.
+inline int pull_scale_tma_row_bytes(int hidden_int4, ncclEpDispQuant_t recipe, int scale_row_bytes,
+                                    size_t smem_optin, int blocks_per_sm) {
+    if (recipe != NCCL_EP_DISP_QUANT_FWD) return 0;
+    if (scale_row_bytes <= 0 || (scale_row_bytes % 16) != 0) return 0;
+    const size_t one_warp = static_cast<size_t>(pull_smem_bytes_per_warp(hidden_int4, scale_row_bytes) +
+                                                pull_static_smem_bytes_per_warp());
+    if (one_warp * static_cast<size_t>(std::max(1, blocks_per_sm)) > smem_optin) return 0;
+    return scale_row_bytes;
+}
+
+inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, ncclEpDispQuant_t recipe,
+                                               int scale_int4_per_lane, int scale_tma_row_bytes,
+                                               int pull_warps) {
+    std::ostringstream src;
+    src << "#include \"device/ht_ep.cuh\"\n"
+        << "\n"
+        << "extern \"C\" __launch_bounds__(" << ::ht_ep::pull_dispatch_threads(pull_warps) << ", " << blocks_per_sm << ")\n"
+        << "__global__ void " << kDispatchPullJitEntryName << "(\n"
+        << "    const __grid_constant__ ::ht_ep::dispatch_pull_param_t p) {\n"
+        << "  ::ht_ep::dispatch_pull<" << hidden_int4 << ", " << pull_stage_literal(hidden_int4)
+        << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ", " << scale_int4_per_lane
+        << ", " << scale_tma_row_bytes << ", " << pull_warps << ">(\n"
+        << "      reinterpret_cast<uint8_t*>(p.recv_x_em),\n"
+        << "      p.recv_topk_weights_em,\n"
+        << "      p.recv_x_scale_em,\n"
+        << "      p.flat2em_slot_map,\n"
+        << "      p.srcpos_map,\n"
+        << "      p.recv_slot_to_src,\n"
+        << "      p.peer_input_ptrs,\n"
+        << "      p.peer_weight_ptrs,\n"
+        << "      p.peer_scale_ptrs,\n"
+        << "      p.num_recv_tokens_dev,\n"
+        << "      p.expert_token_offsets,\n"
+        << "      p.per_expert_counts_active,\n"
+        << "      p.top_k,\n"
+        << "      p.experts_per_rank,\n"
+        << "      p.row_bytes,\n"
+        << "      p.scale_row_bytes,\n"
+        << "      p.caller_num_recv_tokens,\n"
+        << "      p.tokens_per_rank,\n"
+        << "      p.lsa_team_size,\n"
+        << "      p.dcomms,\n"
+        << "      p.head_sync_flag,\n"
+        << "      p.grid_barrier_counter,\n"
+        << "      p.unfused_sync);\n"
+        << "}\n";
+    return src.str();
+}
+
+inline ncclResult_t
+launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, ncclEpDispQuant_t recipe,
+                        cudaStream_t stream) {
+    static const int variant_identity = 0;
+    assert((param.row_bytes % 16) == 0);
+    const int hidden_int4 = param.row_bytes / 16;
+    const int blocks_per_sm = pick_pull_blocks_per_sm(hidden_int4);
+    // Per-lane int4 capacity for the FWD scale row, sized from the actual scale row so
+    // any scale dtype / quantization block size fits (1 for NONE, where scale_row_bytes==0).
+    const int scale_int4_per_lane = std::max(1, ((param.scale_row_bytes / 16) + 31) / 32);
+    const size_t smem_optin = pull_device_smem_optin();
+    const int scale_tma_row_bytes = pull_scale_tma_row_bytes(
+        hidden_int4, recipe, param.scale_row_bytes, smem_optin, blocks_per_sm);
+    const int pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm);
+
+    const std::string variant_name = [&] {
+        std::ostringstream name;
+        name << "dispatch_pull_h" << hidden_int4 << "_b" << blocks_per_sm
+             << "_r" << static_cast<int>(recipe) << "_s" << scale_int4_per_lane
+             << "_st" << scale_tma_row_bytes << "_w" << pull_warps;
+        return name.str();
+    }();
+    const std::string source = dispatch_pull_jit_source(hidden_int4, blocks_per_sm, recipe, scale_int4_per_lane,
+                                                        scale_tma_row_bytes, pull_warps);
+
+    ::nccl_ep::jit::JitKernelVariant variant;
+    variant.kernel_family = "ht_dispatch_pull";
+    variant.variant_name = variant_name;
+    variant.source = source;
+    variant.entry_name = kDispatchPullJitEntryName;
+    variant.identity = &variant_identity;
+    // Hash the variant name: it already carries every specialization parameter, and
+    // the cache key is (identity, runtime_key, context, device) only - a hand-packed
+    // bitfield would silently alias once a field (e.g. scale_tma_row_bytes) overflows.
+    variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
+    variant.num_blocks = num_blocks * blocks_per_sm;
+    variant.block_dim = ::ht_ep::pull_dispatch_threads(pull_warps);
+    variant.dynamic_smem_bytes = pull_dynamic_smem_bytes(hidden_int4, scale_tma_row_bytes, pull_warps);
+
+    std::string error;
+    const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+
+    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
+        // The oversize-hidden smem case (kAttributeFailed) is pre-rejected in ncclEpDispatch
+        // via dispatch_pull_smem_bytes, so a failure here is unexpected (compile/driver
+        // error); surface it to the caller instead of aborting the process.
+        // TODO: add a graceful fallback (local-permute dispatch, or a cap-reduced warp count).
+        std::fprintf(stderr, "[nccl_ep jit] dispatch-pull JIT launch failure for %s: %s%s%s\n",
+                     variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status), error.empty() ? "" : ": ",
+                     error.empty() ? "" : error.c_str());
+        return ncclInternalError;
+    }
+    return ncclSuccess;
 }
 
 } // namespace jit

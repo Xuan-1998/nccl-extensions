@@ -51,6 +51,8 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->debug);
     parse_flag(cfg->ht_em_local_dup);
     parse_flag(cfg->ht_em_nvlink_dup);
+    parse_flag(cfg->ht_em_pull_push);
+    parse_flag(cfg->ht_unfused_sync);
     parse_flag(cfg->disable_guard);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
@@ -75,6 +77,8 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.debug,
         &cfg.ht_em_local_dup,
         &cfg.ht_em_nvlink_dup,
+        &cfg.ht_em_pull_push,
+        &cfg.ht_unfused_sync,
         &cfg.disable_guard,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,

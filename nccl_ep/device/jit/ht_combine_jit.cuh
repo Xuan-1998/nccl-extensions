@@ -479,6 +479,165 @@ inline void launch_local_permute_reduce(
     }
 }
 
+// ======================== Push EM combine + reduce =========================
+// Local gather-reduce + remote push (head/tail intra-LSA syncs fused in) and the final
+// team_size reduce. See ht_ep.cuh combine_push / combine_reduce.
+constexpr const char* kCombinePushJitEntryName = "nccl_ep_jit_ht_combine_push_kernel";
+constexpr const char* kCombineReduceJitEntryName = "nccl_ep_jit_ht_combine_epi_reduce_kernel";
+
+inline ncclResult_t launch_combine_push(
+    int top_k,
+    int row_bytes,
+    int num_blocks,
+    ::ht_ep::combine_push_param_t& param,
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16,
+    bool backward = false) {
+    static const int variant_identity = 0;
+    assert((row_bytes % 16) == 0);
+    const int hidden_int4 = row_bytes / 16;
+    const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* backward_literal = backward ? "true" : "false";
+    // Size the block so the per-warp smem row buffer fits the device opt-in cap, before building
+    // the source so __launch_bounds__ matches the actual block (right register budget per block
+    // size, not a fixed max that would spill small blocks).
+    int smem_cap = 0, dev = 0;
+    (void)cudaGetDevice(&dev);
+    (void)cudaDeviceGetAttribute(&smem_cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    const int slots = ::ht_ep::combine_push_slots_per_block(hidden_int4, smem_cap);
+    const int block_dim = slots * 32;
+
+    const std::string variant_name = [&] {
+        std::ostringstream name;
+        name << "combine_push_topk" << top_k << "_h" << hidden_int4
+             << ::nccl_ep::jit::token_dtype_name_tag(token_dtype) << (backward ? "_bwd" : "");
+        return name.str();
+    }();
+    const std::string source = [&] {
+        std::ostringstream src;
+        src << "#include \"device/ht_ep.cuh\"\n"
+            << "\n"
+            << "extern \"C\" __launch_bounds__(" << block_dim << ", 1)\n"
+            << "__global__ void " << kCombinePushJitEntryName << "(\n"
+            << "    const __grid_constant__ ::ht_ep::combine_push_param_t p) {\n"
+            << "  extern __shared__ uint8_t smem_bytes[];\n"
+            << "  ::ht_ep::combine_push<" << top_k << ", " << hidden_int4 << ", " << token_dtype_literal
+            << ", " << backward_literal << ">(\n"
+            << "      p.peer_staging_ptrs,\n"
+            << "      reinterpret_cast<const uint8_t*>(p.recv_x_em),\n"
+            << "      p.flat2em_slot_map,\n"
+            << "      p.recv_slot_to_src,\n"
+            << "      p.num_recv_tokens_dev,\n"
+            << "      p.dcomms,\n"
+            << "      p.head_sync_flag,\n"
+            << "      p.grid_barrier_counter,\n"
+            << "      p.top_k,\n"
+            << "      p.row_bytes,\n"
+            << "      p.caller_num_recv_tokens,\n"
+            << "      p.my_lsa_rank,\n"
+            << "      p.tokens_per_rank,\n"
+            << "      p.lsa_team_size,\n"
+            << "      p.topk_weights_em,\n"
+            << "      p.srcpos_map,\n"
+            << "      p.unfused_sync,\n"
+            << "      smem_bytes);\n"
+            << "}\n";
+        return src.str();
+    }();
+
+    ::nccl_ep::jit::JitKernelVariant variant;
+    variant.kernel_family = "ht_combine_push";
+    variant.variant_name = variant_name;
+    variant.source = source;
+    variant.entry_name = kCombinePushJitEntryName;
+    variant.identity = &variant_identity;
+    variant.runtime_key = (static_cast<std::uint64_t>(backward) << 63) |
+                          (static_cast<std::uint64_t>(token_dtype) << 48) |
+                          (static_cast<std::uint64_t>(hidden_int4) << 16) | static_cast<std::uint64_t>(top_k);
+    variant.num_blocks = num_blocks;
+    variant.block_dim = block_dim;
+    variant.dynamic_smem_bytes =
+        static_cast<int>(::ht_ep::combine_push_dynamic_smem_bytes(hidden_int4, slots));
+
+    std::string error;
+    const ::nccl_ep::jit::JitKernelStatus status =
+        ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
+        std::fprintf(stderr, "[nccl_ep jit] combine-push JIT launch failure for %s: %s%s%s\n",
+                     variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status),
+                     error.empty() ? "" : ": ", error.empty() ? "" : error.c_str());
+        return ncclInternalError;
+    }
+    return ncclSuccess;
+}
+
+inline ncclResult_t launch_combine_reduce_stage(
+    int row_bytes,
+    int num_blocks,
+    ::ht_ep::combine_reduce_param_t& param,
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16,
+    bool backward = false) {
+    static const int variant_identity = 0;
+    assert((row_bytes % 16) == 0);
+    const int hidden_int4 = row_bytes / 16;
+    const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
+    const char* backward_literal = backward ? "true" : "false";
+
+    const std::string variant_name = [&] {
+        std::ostringstream name;
+        name << "combine_reduce_h" << hidden_int4 << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
+             << (backward ? "_bwd" : "");
+        return name.str();
+    }();
+    const std::string source = [&] {
+        std::ostringstream src;
+        src << "#include \"device/ht_ep.cuh\"\n"
+            << "\n"
+            << "extern \"C\" __launch_bounds__(" << ::ht_ep::kLocalPermuteReduceThreads << ", 1)\n"
+            << "__global__ void " << kCombineReduceJitEntryName << "(\n"
+            << "    const __grid_constant__ ::ht_ep::combine_reduce_param_t p) {\n"
+            << "  ::ht_ep::combine_reduce<" << hidden_int4 << ", " << token_dtype_literal << ", "
+            << backward_literal << ">(\n"
+            << "      reinterpret_cast<uint8_t*>(p.attn_output),\n"
+            << "      reinterpret_cast<const uint8_t*>(p.staging),\n"
+            << "      p.topk_idx,\n"
+            << "      p.num_topk,\n"
+            << "      p.experts_per_rank,\n"
+            << "      p.experts_per_lsa_team,\n"
+            << "      p.num_combined_tokens,\n"
+            << "      p.lsa_team_size,\n"
+            << "      p.row_bytes,\n"
+            << "      p.combined_topk_weights,\n"
+            << "      p.top_k);\n"
+            << "}\n";
+        return src.str();
+    }();
+
+    ::nccl_ep::jit::JitKernelVariant variant;
+    variant.kernel_family = "ht_combine_epi_reduce";
+    variant.variant_name = variant_name;
+    variant.source = source;
+    variant.entry_name = kCombineReduceJitEntryName;
+    variant.identity = &variant_identity;
+    variant.runtime_key = (static_cast<std::uint64_t>(backward) << 63) |
+        (static_cast<std::uint64_t>(token_dtype) << 48) | static_cast<std::uint64_t>(hidden_int4);
+    variant.num_blocks = num_blocks;
+    variant.block_dim = ::ht_ep::kLocalPermuteReduceThreads;
+    variant.dynamic_smem_bytes = 0;
+
+    std::string error;
+    const ::nccl_ep::jit::JitKernelStatus status =
+        ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+    if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
+        std::fprintf(stderr, "[nccl_ep jit] combine-reduce JIT launch failure for %s: %s%s%s\n",
+                     variant_name.c_str(), ::nccl_ep::jit::jit_kernel_status_name(status),
+                     error.empty() ? "" : ": ", error.empty() ? "" : error.c_str());
+        return ncclInternalError;
+    }
+    return ncclSuccess;
+}
+
 } // namespace jit
 } // namespace ht
 } // namespace nccl_ep

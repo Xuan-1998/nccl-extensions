@@ -367,6 +367,12 @@ __device__ __forceinline__ uint64_t ld_relaxed_sys_global(const uint64_t* ptr) {
     return ret;
 }
 
+__device__ __forceinline__ uint32_t ld_relaxed_gpu_global(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
 __device__ __forceinline__ uint64_t ld_relaxed_gpu_global(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.relaxed.gpu.global.b64 %0, [%1];" : "=l"(ret) : "l"(__cvta_generic_to_global(ptr)) : "memory");
@@ -497,6 +503,10 @@ __device__ __forceinline__ int4 ld_nc_global(const int4* ptr) {
 
 __device__ __forceinline__ void st_release_sys_global(const int* ptr, int val) {
     asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
+}
+
+__device__ __forceinline__ void st_release_gpu_global(const int* ptr, int val) {
+    asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
 }
 
 __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
@@ -877,6 +887,24 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t& phas
     phase ^= kWithMultiStages ? (1 << stage_idx) : 1;
 }
 
+// Spin until an mbarrier reaches the given parity, without flipping it. The caller owns the
+// parity (e.g. a multi-stage ring flips it once per wrap), unlike mbarrier_wait above which
+// auto-flips for single-buffer reuse.
+__device__ __forceinline__ void mbarrier_wait_parity(uint64_t* mbar_ptr, uint32_t parity) {
+    auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+    asm volatile(
+        "{\n\t"
+        ".reg .pred       P1; \n\t"
+        "LAB_WAIT_P: \n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2; \n\t"
+        "@P1 bra DONE_P; \n\t"
+        "bra     LAB_WAIT_P; \n\t"
+        "DONE_P: \n\t"
+        "}" ::"r"(mbar_int_ptr),
+        "r"(parity),
+        "r"(0x989680));
+}
+
 __device__ __forceinline__ void mbarrier_arrive_and_expect_tx(uint64_t* mbar_ptr, int num_bytes) {
     auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t" ::"r"(num_bytes), "r"(mbar_int_ptr));
@@ -933,6 +961,14 @@ tma_store_1d(const void* smem_ptr, const void* gmem_ptr, int num_bytes, bool evi
 template <int N = 0>
 __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
+}
+
+// Wait until at most N committed bulk-store groups remain, including the global write completing
+// (stronger than tma_store_wait, which only waits for the shared-memory read phase). Use before a
+// system fence when a consumer on another device must observe the pushed bytes.
+template <int N = 0>
+__device__ __forceinline__ void tma_store_wait_complete() {
+    asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N) : "memory");
 }
 
 #endif // DISABLE_SM90_FEATURES

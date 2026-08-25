@@ -121,4 +121,19 @@ for mode in LOCAL_DUP NVLINK_DUP; do
     unset "NCCL_EP_HT_EM_${mode}"
 done
 
+# Pull-dispatch / push-combine (single NVLink LSA team, expert-major only). Restricted to the
+# suites with expert-major dispatch/combine coverage; the non-expert-major cases in them skip
+# via SKIP_IF_PULL_PUSH. All ranks form one LSA team so the push combine's single-team path runs.
+PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe"
+export NCCL_EP_HT_EM_PULL_PUSH=1
+export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
+for entry in "${SUITES[@]}"; do
+    IFS='|' read -r bin desc _ <<<"${entry}"
+    [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
+    [[ " ${PULL_PUSH_SUITES} " == *" ${bin} "* ]] || continue
+    run_suite "${bin}" "${desc} (Pull-Push)"
+done
+unset NCCL_EP_HT_EM_PULL_PUSH
+unset NCCL_LSA_TEAM_SIZE
+
 exit "${OVERALL_FAIL}"

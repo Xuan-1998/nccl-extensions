@@ -57,6 +57,20 @@ void convert_topk_to_routing_map(
     int row_bytes,                   // per-token stride = experts_per_lsa_team_packed * num_lsa_teams
     cudaStream_t stream);
 
+// Pull dispatch: order-preserving alternative to the bitmap routing map. Emits each
+// token's top-k global expert ids as uint16 (row stride = num_topk), kTopkIdxInvalid
+// for empty slots and tail rows [num_tokens, max_tokens). cached_topk_idx mirrors
+// topk_idx in its native width (int32/int64), as in convert_topk_to_routing_map.
+template <typename TopkIdxT>
+void pack_topk_idx(
+    const TopkIdxT* topk_idx,
+    uint16_t* topk_idx_u16,
+    TopkIdxT* cached_topk_idx,
+    int num_tokens,
+    int max_tokens,
+    int num_topk,
+    cudaStream_t stream);
+
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob (for dispatch input)
 // ============================================================================
@@ -179,6 +193,13 @@ ncclResult_t call_metadata_preprocessing(
     // NCCL_EP_OVERFLOW_DROP: drop tokens whose recv slot exceeds the budget
     // instead of trapping on overflow.
     bool allow_overflow_drop = false,
+    // Pull dispatch: recv slot -> global source token id. Null unless pull is enabled.
+    int32_t* recv_slot_to_src = nullptr,
+    // Pull dispatch: source top-k position of each hit (parallel to flat2em).
+    int32_t* srcpos_map = nullptr,
+    // Pull dispatch: order-preserving uint16 topk routing map + gate.
+    const uint16_t* global_topk_idx = nullptr,
+    bool use_topk_idx = false,
     cudaStream_t stream = 0);
 
 // Returns required size in bytes for the scan temp buffer used by call_metadata_preprocessing.
@@ -260,6 +281,100 @@ void launch_dispatch_permute(
     void* recv_scales_em,
     const void* flat_scale_staging,
     int scale_row_bytes);
+
+// Pull EM dispatch (MNNVL): each receiver reads its source rows and topk weights
+// directly from the source ranks' input buffers over NVLink and scatters them into
+// EM zones. peer_input_ptrs / peer_weight_ptrs are device arrays [lsa_team_size] of
+// source base pointers. shuffle_sms=0 picks sm_count.
+ncclResult_t launch_dispatch_pull(
+    void* recv_x_em,
+    float* recv_topk_weights_em,
+    void* recv_x_scale_em,
+    const int32_t* flat2em_slot_map,
+    const int32_t* srcpos_map,
+    const int32_t* recv_slot_to_src,
+    const void* const* peer_input_ptrs,
+    const float* const* peer_weight_ptrs,
+    const void* const* peer_scale_ptrs,
+    const int32_t* num_recv_tokens_dev,
+    const int64_t* expert_token_offsets,
+    const int32_t* per_expert_counts_active,
+    int top_k,
+    int experts_per_rank,
+    int row_bytes,
+    int scale_row_bytes,
+    int caller_num_recv_tokens,
+    int tokens_per_rank,
+    int lsa_team_size,
+    int sm_count,
+    unsigned int shuffle_sms,
+    ncclEpDispQuant_t recipe,
+    ncclDevComm_t* dcomms,
+    uint32_t* head_sync_flag,
+    uint32_t* grid_barrier_counter,
+    cudaStream_t stream,
+    // When true, run the intra-LSA head/tail sync as separate kernels around this launch.
+    bool unfused_sync = false);
+
+// Minimum shared-memory bytes launch_dispatch_pull requires for a given row width
+// (int4 units): what a single pull warp needs, static and dynamic. Callers compare this
+// against the device opt-in smem cap; a row that does not fit one warp is unsupported.
+size_t dispatch_pull_smem_bytes(int hidden_int4);
+
+// Push-combine staging row stride (bytes) for a given token row width. The combine
+// input staging must be sized by this so the buffer matches the stride combine_push
+// writes and combine_reduce reads. reserve_prob (backward) co-locates the prob row
+// in the token row's trailing pad.
+size_t comb_stage_stride_bytes(int row_bytes, bool reserve_prob);
+
+// Push EM combine (mirror of pull EM dispatch). The push kernel does the local
+// gather-reduce + remote push with the head/tail intra-LSA syncs fused in; the reduce
+// kernel does the final team_size sum. peer_staging_ptrs is a [lsa_team_size] array of
+// peer-writable dst staging bases (indexed by dst_rank == the source rank's slot in the team).
+ncclResult_t launch_combine_push(
+    void* const* peer_staging_ptrs,
+    const void* recv_x_em,
+    const int32_t* flat2em_slot_map,
+    const int32_t* recv_slot_to_src,
+    const int32_t* num_recv_tokens_dev,
+    ncclDevComm_t* dcomms,
+    uint32_t* head_sync_flag,
+    uint32_t* grid_barrier_counter,
+    int top_k,
+    int row_bytes,
+    int caller_num_recv_tokens,
+    int my_lsa_rank,
+    int tokens_per_rank,
+    int lsa_team_size,
+    int sm_count,
+    unsigned int shuffle_sms,
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16,
+    // Backward combine (sparse-direct prob scatter into the token staging pad); null/false on forward.
+    const float* topk_weights_em = nullptr,
+    const int32_t* srcpos_map = nullptr,
+    bool backward = false,
+    // When true, run the intra-LSA head/tail sync as separate kernels around this launch.
+    bool unfused_sync = false);
+
+ncclResult_t launch_combine_reduce_stage(
+    void* attn_output,
+    const void* staging,
+    const uint16_t* topk_idx,
+    int num_topk,
+    int experts_per_rank,
+    int experts_per_lsa_team,
+    int num_combined_tokens,
+    int lsa_team_size,
+    int row_bytes,
+    int sm_count,
+    unsigned int shuffle_sms,
+    cudaStream_t stream,
+    ncclDataType_t token_dtype = ncclBfloat16,
+    // Backward combine: gather each srcpos weight from the token staging pad into combined_topk_weights.
+    float* combined_topk_weights = nullptr,
+    int top_k = 0,
+    bool backward = false);
 
 // Inverse of launch_dispatch_permute: gather caller EM combine input into
 // FLAT staging by summing the top_k EM rows per FLAT recv slot. Optional

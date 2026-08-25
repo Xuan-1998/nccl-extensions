@@ -243,6 +243,7 @@ protected:
 // ── Test: rank-major layout ────────────────────────────────────────────────────
 
 TEST_F(OutputLayoutTest, RankMajorLayout) {
+    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -352,6 +353,7 @@ TEST_F(OutputLayoutTest, ExpertMajorWithAlignment) {
 // dispatch + identity expert + combine must recover the original token values.
 
 TEST_F(OutputLayoutTest, CombineRankMajor) {
+    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -477,6 +479,7 @@ TEST_F(OutputLayoutTest, TotalCounterDeviceEM) {
 
 // FLAT: unpadded total = sum of per-expert recv counts (kNumTokens for our routing).
 TEST_F(OutputLayoutTest, TotalCounterDeviceFLAT) {
+    SKIP_IF_PULL_PUSH();
     int32_t* d_total;
     CUDA_ASSERT(cudaMalloc(&d_total, sizeof(int32_t)));
     CUDA_ASSERT(cudaMemset(d_total, 0, sizeof(int32_t)));
@@ -508,6 +511,7 @@ TEST_F(OutputLayoutTest, TotalCounterDeviceFLAT) {
 // rejects undersized recv buffers before any kernel writes caller memory.
 
 TEST_F(OutputLayoutTest, EagerRecvSize) {
+    SKIP_IF_PULL_PUSH();  // exercises the FLAT sub-case
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
     gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     gcfg.num_experts = kNumExperts;
@@ -571,12 +575,15 @@ TEST_F(OutputLayoutTest, EagerRecvSize) {
         EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
         EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
 
-        // Undersized recv buffer: rejected on host before any kernel launch.
-        ncclEpTensor_t* t_recv_small = nullptr;
-        NCCL_ASSERT(epTensorCreate(&t_recv_small, 2, ncclBfloat16, d_recv, num_recv - 1, kHidden));
-        d_out_s.tokens = t_recv_small;
-        EXPECT_EQ(ncclEpDispatch(h, &d_in_s, &d_out_s, nullptr, &dcfg, g_stream), ncclInvalidArgument);
-        ncclEpTensorDestroy(t_recv_small);
+        // Undersized recv buffer: FLAT rejects on host before any kernel launch. The EM path is
+        // sync-free (no per-dispatch D2H), so undersize is not host-rejected there.
+        if (!em) {
+            ncclEpTensor_t* t_recv_small = nullptr;
+            NCCL_ASSERT(epTensorCreate(&t_recv_small, 2, ncclBfloat16, d_recv, num_recv - 1, kHidden));
+            d_out_s.tokens = t_recv_small;
+            EXPECT_EQ(ncclEpDispatch(h, &d_in_s, &d_out_s, nullptr, &dcfg, g_stream), ncclInvalidArgument);
+            ncclEpTensorDestroy(t_recv_small);
+        }
 
         ncclEpTensorDestroy(t_tok);
         ncclEpTensorDestroy(t_recv);
@@ -609,6 +616,7 @@ TEST_F(OutputLayoutTest, EagerRecvSize) {
 // handle time, read it back on the host, size the dispatch outputs to it, dispatch.
 // Covers FLAT and EM -- for EM the counter reports the padded total.
 TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
+    SKIP_IF_PULL_PUSH();  // exercises the FLAT sub-case
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
     gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     gcfg.num_experts = kNumExperts;
@@ -693,13 +701,16 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
         EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
         EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
 
-        // One row short of the published count must be rejected on the host.
-        ncclEpTensor_t* t_recv_small = nullptr;
-        NCCL_ASSERT(epTensorCreate(&t_recv_small, 2, ncclBfloat16, d_recv, num_recv - 1, kHidden));
-        d_out.tokens = t_recv_small;
-        EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclInvalidArgument)
-            << "Rank " << g_rank << ": a buffer below recv_total_counter must be rejected";
-        ncclEpTensorDestroy(t_recv_small);
+        // One row short of the published count must be rejected on the host (FLAT only; the EM
+        // path is sync-free, so it does not host-reject undersize).
+        if (!em) {
+            ncclEpTensor_t* t_recv_small = nullptr;
+            NCCL_ASSERT(epTensorCreate(&t_recv_small, 2, ncclBfloat16, d_recv, num_recv - 1, kHidden));
+            d_out.tokens = t_recv_small;
+            EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclInvalidArgument)
+                << "Rank " << g_rank << ": a buffer below recv_total_counter must be rejected";
+            ncclEpTensorDestroy(t_recv_small);
+        }
 
         ncclEpTensorDestroy(t_tok);
         ncclEpTensorDestroy(t_recv);
@@ -734,6 +745,7 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
 // Routing: every token on every rank → expert 0 (hosted on rank 0), top-k 1.
 // Rank 0 receives g_nranks * kNumTokens tokens; all other ranks receive zero.
 TEST_F(OutputLayoutTest, EagerZeroRecv) {
+    SKIP_IF_PULL_PUSH();  // exercises the FLAT sub-case
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
     gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     gcfg.num_experts = kNumExperts;
@@ -1038,6 +1050,157 @@ TEST_F(OutputLayoutTest, EagerZeroRecv) {
     NCCL_ASSERT(ncclEpGroupDestroy(eager_group));
 }
 
+// Eager zero-recv forward combine round trip. Skewed routing (token i -> the first
+// top_k experts, all hosted on rank 0): rank 0 receives every rank's tokens, all
+// others receive zero. Recv tokens are per-slot weighted by the dispatched
+// recv_topk_weights before combine (the MoE combine input), so the value round trip
+// depends on the forwarded weights. Weights sum to 1 per token, so each rank's
+// combined[i] must equal its own source token. Under pull dispatch + push combine
+// (NCCL_EP_HT_EM_PULL_PUSH) a zero-recv rank is still a source, so its input weights
+// must reach the receiver.
+static void run_eager_zero_recv_fwd_combine(int top_k) {
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kNumTokens;
+    gcfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank = NCCL_EP_AUTO;
+    gcfg.num_channels = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank = NCCL_EP_AUTO; // eager mode
+    gcfg.num_topk = top_k;
+    ncclEpGroup_t eager_group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&eager_group, g_comm, &gcfg));
+
+    // Skewed routing: token i -> experts {0..top_k-1}, all hosted on rank 0.
+    std::vector<int64_t> h_idx(kNumTokens * top_k);
+    for (int i = 0; i < kNumTokens; ++i)
+        for (int k = 0; k < top_k; ++k) h_idx[i * top_k + k] = k;
+    int64_t* d_idx = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_idx, h_idx.size() * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMemcpy(d_idx, h_idx.data(), h_idx.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+    ncclEpTensor_t* t_idx = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_idx, 2, ncclInt64, d_idx, kNumTokens, top_k));
+
+    // Distinct, exactly-representable per-token payloads; weights sum to 1 per token
+    // so the identity round trip recovers the source token value exactly.
+    std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
+    for (int i = 0; i < kNumTokens; ++i) {
+        const float v = static_cast<float>(g_rank * kNumTokens + i + 1);
+        for (int hh = 0; hh < kHidden; ++hh) h_tok[i * kHidden + hh] = __float2bfloat16(v);
+    }
+    std::vector<float> h_w(kNumTokens * top_k, 1.0f / static_cast<float>(top_k));
+    nv_bfloat16* d_tok = nullptr;
+    float* d_w = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_tok, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMalloc(&d_w, kNumTokens * top_k * sizeof(float)));
+    CUDA_ASSERT(cudaMemcpy(d_tok, h_tok.data(), kNumTokens * kHidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(d_w, h_w.data(), kNumTokens * top_k * sizeof(float), cudaMemcpyHostToDevice));
+    ncclEpTensor_t *t_tok = nullptr, *t_w = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_tok, 2, ncclBfloat16, d_tok, kNumTokens, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_w, 2, ncclFloat32, d_w, kNumTokens, top_k));
+
+    ncclEpHandle_t h = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(
+        &h, eager_group, NCCL_EP_LAYOUT_EXPERT_MAJOR, t_idx, nullptr, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    unsigned int num_recv = ~0u;
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+    if (g_rank == 0) EXPECT_GT(num_recv, 0u) << "Rank 0 must receive every sender's tokens";
+    else EXPECT_EQ(num_recv, 0u) << "Rank " << g_rank << " must receive zero tokens";
+    const bool zero_recv = (num_recv == 0);
+
+    // Recv outputs: real buffers on rank 0, empty descriptors (0 rows, data == nullptr)
+    // on the zero-recv ranks.
+    nv_bfloat16* d_recv = nullptr;
+    float* d_recv_w = nullptr;
+    if (!zero_recv) {
+        CUDA_ASSERT(cudaMalloc(&d_recv, num_recv * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMalloc(&d_recv_w, num_recv * sizeof(float)));
+        CUDA_ASSERT(cudaMemset(d_recv, 0, num_recv * kHidden * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMemset(d_recv_w, 0, num_recv * sizeof(float)));
+    }
+    ncclEpTensor_t *t_recv = nullptr, *t_recv_w = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_recv, 2, ncclBfloat16, d_recv, num_recv, kHidden));
+    NCCL_ASSERT(epTensorCreate(&t_recv_w, 1, ncclFloat32, d_recv_w, num_recv));
+
+    // FWD dispatch.
+    {
+        ncclEpDispatchInputs_t d_in = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t d_out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        d_in.tokens = t_tok;
+        d_in.topk_weights = t_w;
+        d_out.tokens = t_recv;
+        d_out.topk_weights = t_recv_w;
+        ncclEpDispatchConfig_t dcfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+        EXPECT_EQ(ncclEpDispatch(h, &d_in, &d_out, nullptr, &dcfg, g_stream), ncclSuccess);
+        EXPECT_EQ(ncclEpComplete(h, nullptr, g_stream), ncclSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+    }
+
+    // Weight the recv tokens by the dispatched recv_topk_weights (identity expert),
+    // mirroring the MoE combine input. Only rank 0 has recv rows here.
+    if (!zero_recv) {
+        std::vector<nv_bfloat16> h_recv(num_recv * kHidden);
+        std::vector<float> h_recv_w(num_recv);
+        CUDA_ASSERT(cudaMemcpy(h_recv.data(), d_recv, num_recv * kHidden * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+        CUDA_ASSERT(cudaMemcpy(h_recv_w.data(), d_recv_w, num_recv * sizeof(float), cudaMemcpyDeviceToHost));
+        for (unsigned int s = 0; s < num_recv; ++s)
+            for (int hh = 0; hh < kHidden; ++hh)
+                h_recv[s * kHidden + hh] =
+                    __float2bfloat16(__bfloat162float(h_recv[s * kHidden + hh]) * h_recv_w[s]);
+        CUDA_ASSERT(cudaMemcpy(d_recv, h_recv.data(), num_recv * kHidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    }
+
+    // FWD combine: feed the weighted recv tokens (empty on zero-recv ranks) back;
+    // every rank must recover its own kNumTokens source values.
+    nv_bfloat16* d_out_x = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_out_x, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+    CUDA_ASSERT(cudaMemset(d_out_x, 0, kNumTokens * kHidden * sizeof(nv_bfloat16)));
+    ncclEpTensor_t* t_out_x = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_out_x, 2, ncclBfloat16, d_out_x, kNumTokens, kHidden));
+    {
+        ncclEpCombineInputs_t c_in = NCCL_EP_COMBINE_INPUTS_INIT;
+        ncclEpCombineOutputs_t c_out = NCCL_EP_COMBINE_OUTPUTS_INIT;
+        c_in.tokens = t_recv;
+        c_out.tokens = t_out_x;
+        EXPECT_EQ(ncclEpCombine(h, &c_in, &c_out, nullptr, g_stream), ncclSuccess)
+            << "Rank " << g_rank << ": zero-recv FWD combine must accept empty combine inputs";
+        EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
+    }
+
+    std::vector<nv_bfloat16> h_out(kNumTokens * kHidden);
+    CUDA_ASSERT(cudaMemcpy(h_out.data(), d_out_x, kNumTokens * kHidden * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < kNumTokens; ++i) {
+        const float expected = static_cast<float>(g_rank * kNumTokens + i + 1);
+        EXPECT_NEAR(bf16_val(h_out[i * kHidden]), expected, 1e-2f)
+            << "Rank " << g_rank << " token " << i << ": FWD combine must round-trip the source token";
+    }
+
+    ncclEpTensorDestroy(t_out_x);
+    cudaFree(d_out_x);
+    ncclEpTensorDestroy(t_recv);
+    ncclEpTensorDestroy(t_recv_w);
+    if (d_recv) cudaFree(d_recv);
+    if (d_recv_w) cudaFree(d_recv_w);
+    ncclEpTensorDestroy(t_tok);
+    ncclEpTensorDestroy(t_w);
+    cudaFree(d_tok);
+    cudaFree(d_w);
+    ncclEpTensorDestroy(t_idx);
+    cudaFree(d_idx);
+    NCCL_ASSERT(ncclEpHandleDestroy(h));
+    NCCL_ASSERT(ncclEpGroupDestroy(eager_group));
+}
+
+TEST_F(OutputLayoutTest, EagerZeroRecvForwardCombine) {
+    run_eager_zero_recv_fwd_combine(/*top_k=*/1);
+}
+
+TEST_F(OutputLayoutTest, EagerZeroRecvForwardCombineTopK2) {
+    run_eager_zero_recv_fwd_combine(/*top_k=*/2);
+}
+
 // ── TopK2MixedRoutingTest fixture ─────────────────────────────────────────────
 // top-k=2 with a fixed routing mixing same-rank pairs (T0/T1) and cross-rank
 // pairs (T2/T3):
@@ -1217,6 +1380,7 @@ protected:
 // ── Test: rank-major — correct recv counts; no duplication for same-rank pairs ─
 
 TEST_F(TopK2MixedRoutingTest, RankMajorLayout) {
+    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t h = make_handle2(nullptr);
     ASSERT_NE(h, nullptr);
 
