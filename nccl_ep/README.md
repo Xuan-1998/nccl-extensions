@@ -151,6 +151,13 @@ layout dimensions as token outputs and `S` as their final dimension. In LL
 rank-major mode, token and scale output descriptors can independently be backed
 by NCCL windows. See the full public API contract in `nccl_ep.h`.
 
+`NCCL_EP_COMB_QUANT_NVFP4` is an experimental LL-only combine recipe for BF16
+expert outputs, supported only on NVFP4-capable devices. Set
+`combine_config.quant_recipe` accordingly and provide one FP32 scale per valid
+expert-output row through `combine_inputs.scales`. The scale tensor is 3D with
+the same leading dimensions as `combine_inputs.tokens` and a final dimension of
+one; each scale is `2688 / amax(abs(row))`, computed from the post-expert BF16 row.
+
 
 #### LL mode (same data type)
 
@@ -467,10 +474,18 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 
 **Low Latency (LL)**:
 - Supports `NCCL_EP_LAYOUT_EXPERT_MAJOR` and `NCCL_EP_LAYOUT_RANK_MAJOR` layouts.
+- Accepts `ncclInt32` or `ncclInt64` routing indices and supports up to 32 top-k
+  entries.
+- For rank-major `topk_idx` output (and HT flat), `layout_info.recv_topk_idx_kind`
+  selects local or global expert IDs; `-1` marks a slot not routed locally.
+  `AUTO` currently selects local IDs; choose `LOCAL` or `GLOBAL` to pin the contract.
 - Output tokens are 3D:
   - expert-major: `[num_local_experts, num_ranks * max_dispatch_tokens_per_rank, hidden]`; `expert_counters[e]` gives the active rows for expert `e`.
   - rank-major:   `[num_ranks, max_dispatch_tokens_per_rank, hidden]`.
 - Supports `send_only` (in `ncclEpDispatchConfig_t` / `ncclEpCombineConfig_t`) to enable computation/communication overlapping.
+- With `zero_copy = NCCL_EP_ZERO_COPY_ON`, rank-major BF16 dispatch requires an
+  NVLink-only topology and a window-backed token output; unsupported cases return an error
+  instead of staging. LL combine remains staged. `AUTO` and `OFF` retain the staging fallback.
 - Does not support dynamic `max_dispatch_tokens_per_rank` detection.
 
 ***`rdma_buffer_size` and lazy allocation (LL only)***
@@ -683,7 +698,7 @@ pointers, so callers can mix stack-, static-, and heap-allocated descriptors.
 //   layout              - [IN]  Receive buffer layout. Required; must not be NCCL_EP_LAYOUT_UNSET.
 //                                HT supports FLAT / EXPERT_MAJOR; LL supports EXPERT_MAJOR / RANK_MAJOR.
 //   topk_idx            - [IN]  Pointer to a caller-owned tensor descriptor holding
-//                               top-K expert indices (2D [num_tokens, top_k] int64).
+//                               top-K expert indices (2D [num_tokens, top_k]; int32 or int64).
 //   layout_info         - [IN/OUT, optional] Named-struct pointer carrying device-side
 //                         metadata tensor pointers. See ncclEpLayoutInfo_t for the fields
 //                         populated at handle time and the layouts each applies to.
