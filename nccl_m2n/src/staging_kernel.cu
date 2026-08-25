@@ -31,16 +31,6 @@
 // Error-check macros (host-side only)
 // ============================================================================
 
-#define SK_NCCLCHECK NCCL_M2N_CHECK
-#define SK_CUDACHECK_IMPL(cmd, errorVar)                                                                        \
-  do {                                                                                                          \
-    cudaError_t errorVar = (cmd);                                                                               \
-    if (errorVar != cudaSuccess) {                                                                              \
-      NCCL_M2N_FAIL(ncclInternalError, -1, "CUDA operation %s failed: %s", #cmd, cudaGetErrorString(errorVar)); \
-    }                                                                                                           \
-  } while (0)
-#define SK_CUDACHECK(cmd) SK_CUDACHECK_IMPL(cmd, NCCL_M2N_UNIQUE(skCudaError_))
-
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
 #define NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT 1
 #else
@@ -98,7 +88,7 @@ template <typename KernelFunc, typename... Args>
 static ncclResult_t launchPipeKernelOrdered(dim3 grid, dim3 block, size_t dynamicSmemBytes, cudaStream_t stream,
                                             KernelFunc kernel, Args&&... args) {
   int cudaDev = -1;
-  SK_CUDACHECK(cudaGetDevice(&cudaDev));
+  NCCL_M2N_CUDACHECK(cudaGetDevice(&cudaDev));
 
   std::lock_guard<std::mutex> lock(gPipeLaunchOrderMutex);
   PipeLaunchOrderState* state = getPipeLaunchOrderState(cudaDev);
@@ -106,9 +96,9 @@ static ncclResult_t launchPipeKernelOrdered(dim3 grid, dim3 block, size_t dynami
                      kPipeLaunchOrderMaxDevices);
 
   if (state->launchComplete == nullptr) {
-    SK_CUDACHECK(cudaEventCreateWithFlags(&state->launchComplete, cudaEventDisableTiming));
+    NCCL_M2N_CUDACHECK(cudaEventCreateWithFlags(&state->launchComplete, cudaEventDisableTiming));
   } else {
-    SK_CUDACHECK(cudaStreamWaitEvent(stream, state->launchComplete, 0));
+    NCCL_M2N_CUDACHECK(cudaStreamWaitEvent(stream, state->launchComplete, 0));
   }
 
   cudaLaunchAttribute attr{};
@@ -531,7 +521,7 @@ ncclResult_t launchStagingReshardDirect(StagingKernelParams* devParams, struct n
 
   StagingReshardKernel_Direct<<<numCtas, threads_per_cta, 0, stream>>>(devParams, *devComm);
 
-  SK_CUDACHECK(cudaGetLastError());
+  NCCL_M2N_CUDACHECK(cudaGetLastError());
 
   if (verbose) {
     printf("[STAGING_KERNEL_DIRECT] Kernel enqueued successfully\n");
@@ -1632,14 +1622,14 @@ static ncclResult_t launchPipeGeneratorSpecialized(const StagingKernelParams* ho
    * body.  That keeps RDMA-only, LSA-only, and mixed generator roles on the
    * same data-flow path without carrying every stage's live state. */
   if constexpr (DoLsaSources) {
-    SK_CUDACHECK(
+    NCCL_M2N_CUDACHECK(
       cudaFuncSetAttribute(StagingReshardKernel_PipeGenerator<TmaTileSize, DoRdmaSources, DoRingForward, DoLsaForward,
                                                               DoLsaSources, SplitMixedRoleCtas>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem_bytes));
   }
 #if NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT
   if (pipeLaunchCompletionEventSupported()) {
-    SK_NCCLCHECK(
+    NCCL_M2N_CHECK(
       (launchPipeKernelOrdered(dim3(grid), dim3(PIPE_GENERATOR_THREADS), dynamic_smem_bytes, stream,
                                StagingReshardKernel_PipeGenerator<TmaTileSize, DoRdmaSources, DoRingForward,
                                                                   DoLsaForward, DoLsaSources, SplitMixedRoleCtas>,
@@ -1652,7 +1642,7 @@ static ncclResult_t launchPipeGeneratorSpecialized(const StagingKernelParams* ho
       <<<grid, PIPE_GENERATOR_THREADS, dynamic_smem_bytes, stream>>>(devParams, devPipePlan, call, *devCommA,
                                                                      *devCommB);
   }
-  SK_CUDACHECK(cudaGetLastError());
+  NCCL_M2N_CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
 
@@ -1725,7 +1715,7 @@ ncclResult_t launchStagingReshardPipeSplit(const StagingKernelParams* hostParams
   if (launch_trainer && trainer_grid > 0) {
 #if NCCLM2N_PIPE_HAS_LAUNCH_COMPLETION_EVENT
     if (pipeLaunchCompletionEventSupported()) {
-      SK_NCCLCHECK((launchPipeKernelOrdered(dim3(trainer_grid), dim3(PIPE_TRAINER_THREADS), 0, stream,
+      NCCL_M2N_CHECK((launchPipeKernelOrdered(dim3(trainer_grid), dim3(PIPE_TRAINER_THREADS), 0, stream,
                                             StagingReshardKernel_PipeTrainer, devParams, devPipePlan, *call, *devCommA,
                                             *devCommB)));
     } else
@@ -1734,28 +1724,28 @@ ncclResult_t launchStagingReshardPipeSplit(const StagingKernelParams* hostParams
       StagingReshardKernel_PipeTrainer<<<trainer_grid, PIPE_TRAINER_THREADS, 0, stream>>>(devParams, devPipePlan, *call,
                                                                                           *devCommA, *devCommB);
     }
-    SK_CUDACHECK(cudaGetLastError());
+    NCCL_M2N_CUDACHECK(cudaGetLastError());
   }
   if (launch_generator && generator_grid > 0) {
     switch (tmaTileSize) {
     case 8 * 1024:
-      SK_NCCLCHECK((launchPipeGeneratorForRole<8 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
+      NCCL_M2N_CHECK((launchPipeGeneratorForRole<8 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
                                                          numCtas, stream)));
       break;
     case 32 * 1024:
-      SK_NCCLCHECK((launchPipeGeneratorForRole<32 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
+      NCCL_M2N_CHECK((launchPipeGeneratorForRole<32 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
                                                           numCtas, stream)));
       break;
     case 64 * 1024:
-      SK_NCCLCHECK((launchPipeGeneratorForRole<64 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
+      NCCL_M2N_CHECK((launchPipeGeneratorForRole<64 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
                                                           numCtas, stream)));
       break;
     case 16 * 1024:
-      SK_NCCLCHECK((launchPipeGeneratorForRole<16 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
+      NCCL_M2N_CHECK((launchPipeGeneratorForRole<16 * 1024>(hostParams, devParams, devPipePlan, *call, devCommA, devCommB,
                                                           numCtas, stream)));
       break;
     default:
-      SK_NCCLCHECK((launchPipeGeneratorForRole<PIPE_GENERATOR_DEFAULT_TMA_TILE_SIZE>(
+      NCCL_M2N_CHECK((launchPipeGeneratorForRole<PIPE_GENERATOR_DEFAULT_TMA_TILE_SIZE>(
         hostParams, devParams, devPipePlan, *call, devCommA, devCommB, numCtas, stream)));
       break;
     }

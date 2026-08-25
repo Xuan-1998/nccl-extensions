@@ -55,7 +55,6 @@
 #include "reshard_kernels.cuh"
 #include "reshard_split.h"
 
-#define SUW_NCCLCHECK NCCL_M2N_CHECK
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
 #define NCCLM2N_RESHARD_GIN_FINAL_FENCE (ncclGinFenceLevel::Put | ncclGinFenceLevel::Get)
@@ -388,7 +387,7 @@ ncclResult_t reshardLaunchPackSplit(const ReshardSplitComms* sc, void* stagingBu
   ncclWindow_t windowA = nullptr, windowB = nullptr;
   ncclDevComm devCommA, devCommB;
   ReshardDevCommUse devCommAUse, devCommBUse;
-  SUW_NCCLCHECK(reshardSplitEnsureResources(sc, stagingBuffer, stagingCapacity, numCtas, ginSignalCountA,
+  NCCL_M2N_CHECK(reshardSplitEnsureResources(sc, stagingBuffer, stagingCapacity, numCtas, ginSignalCountA,
                                             /*ginCounterCountA=*/0, signalsPerSlotB, /*countersPerSlotB=*/0,
                                             ctxPerSlotB, maxConcurrency, stream, &windowA, &windowB, &devCommA,
                                             &devCommAUse, &devCommB, &devCommBUse));

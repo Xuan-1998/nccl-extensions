@@ -48,8 +48,6 @@
 #include "reshard_internal.h"
 #include "reshard_split.h"
 
-#define SP_NCCLCHECK NCCL_M2N_CHECK
-#define SP_CUDACHECK NCCL_M2N_CUDACHECK
 
 static std::mutex gCrossNicOverrideMutex;
 static int gCrossNicOverrideUsers = 0;
@@ -193,7 +191,7 @@ ncclResult_t getSplitBroadcastScratch(int** out) {
   NCCL_M2N_CHECK_ARG(out != nullptr, -1, "split broadcast scratch requires output pointer");
   *out = nullptr;
   int cudaDev = -1;
-  SP_CUDACHECK(cudaGetDevice(&cudaDev));
+  NCCL_M2N_CUDACHECK(cudaGetDevice(&cudaDev));
   for (int i = 0; i < gSplitBroadcastScratchCount; i++) {
     if (gSplitBroadcastScratch[i].cudaDev == cudaDev) {
       *out = gSplitBroadcastScratch[i].dev;
@@ -203,7 +201,7 @@ ncclResult_t getSplitBroadcastScratch(int** out) {
   NCCL_M2N_CHECK_ARG(gSplitBroadcastScratchCount < kSplitBroadcastScratchMaxDevices, -1,
                      "split broadcast scratch cache exhausted (%d CUDA devices)", kSplitBroadcastScratchMaxDevices);
   int* dev = nullptr;
-  SP_CUDACHECK(cudaMalloc(&dev, 2 * sizeof(int)));
+  NCCL_M2N_CUDACHECK(cudaMalloc(&dev, 2 * sizeof(int)));
   gSplitBroadcastScratch[gSplitBroadcastScratchCount++] = {cudaDev, dev};
   *out = dev;
   return ncclSuccess;
@@ -307,7 +305,7 @@ static ncclResult_t broadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int lo
   int* dev = nullptr;
   {
     std::lock_guard<std::mutex> guard(gSplitBroadcastScratchMutex);
-    SP_NCCLCHECK(getSplitBroadcastScratch(&dev));
+    NCCL_M2N_CHECK(getSplitBroadcastScratch(&dev));
   }
   int host = localValue;
   ncclResult_t rc = ncclSuccess;
@@ -354,7 +352,7 @@ static ncclResult_t broadcastMaxInt(ncclComm_t comm, cudaStream_t stream, int lo
 ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const ncclMesh_t* dstMesh,
                                cudaStream_t stream, CommBSharedEntry** out) {
   int parentRank = -1;
-  SP_NCCLCHECK(ncclCommUserRank(comm, &parentRank));
+  NCCL_M2N_CHECK(ncclCommUserRank(comm, &parentRank));
 
   const int dstStart = dstMesh->startRank;
   const int dstSize = dstMesh->dims[0] * dstMesh->dims[1];
@@ -369,14 +367,14 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
    * decision collective-consistent with its trainer ranks. */
   const int localHasCommB = (isDst && shared != nullptr && shared->commB != nullptr) ? 1 : 0;
   int commBExists = 0;
-  SP_NCCLCHECK(broadcastMaxInt(comm, stream, localHasCommB, &commBExists));
+  NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localHasCommB, &commBExists));
 
   /* A cached commB must retain the same source membership. Otherwise use the
    * parent path instead of mixing distinct split topologies in one commB. */
   const int localSharedSrcSize = (isDst && shared != nullptr) ? shared->srcSize : 0;
   int sharedSrcSize = 0;
   if (commBExists) {
-    SP_NCCLCHECK(broadcastMaxInt(comm, stream, localSharedSrcSize, &sharedSrcSize));
+    NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localSharedSrcSize, &sharedSrcSize));
     if (sharedSrcSize != srcSize) {
       RESHARD_INFO(parentRank,
                    "split-comm: cached commB source size mismatch (cached=%d requested=%d) for gen set [%d,%d); "
@@ -389,7 +387,7 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
 
   const int localCacheFull = (shared == nullptr && gCommBSharedCount >= kMaxSplitCommEntries) ? 1 : 0;
   int cacheFull = 0;
-  SP_NCCLCHECK(broadcastMaxInt(comm, stream, localCacheFull, &cacheFull));
+  NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localCacheFull, &cacheFull));
   if (cacheFull) {
     NCCL_M2N_FAIL(ncclInvalidArgument, parentRank,
                   "split-comm: commB shared cache full (%d); refusing gen set [%d,%d). Increase "
@@ -451,10 +449,10 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
 
     /* Probe commB for lsaSize (generator ranks only). */
     if (isDst && commB != nullptr) {
-      SP_NCCLCHECK(createProbeDevComm(commB, NCCLM2N_GIN_RAIL_CONNECTION, &probeDevComm));
+      NCCL_M2N_CHECK(createProbeDevComm(commB, NCCLM2N_GIN_RAIL_CONNECTION, &probeDevComm));
       probeValid = true;
       localLsa = (probeDevComm.lsaSize > 0) ? probeDevComm.lsaSize : 0;
-      SP_NCCLCHECK(ncclCommUserRank(commB, &rankInB));
+      NCCL_M2N_CHECK(ncclCommUserRank(commB, &rankInB));
     }
   }
 
@@ -462,7 +460,7 @@ ncclResult_t ensureCommBShared(ncclComm_t comm, const ncclMesh_t* srcMesh, const
    * Keeps the collective symmetric and lets trainer ranks learn the gen
    * NVL-domain size for their per-parent eligibility / K computation. */
   int lsaSize = 0;
-  SP_NCCLCHECK(broadcastMaxInt(comm, stream, localLsa, &lsaSize));
+  NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localLsa, &lsaSize));
 
   int numGenDomains = 0;
   if (lsaSize > 0 && dstSize > 0) {
@@ -516,7 +514,7 @@ ncclResult_t ensureCommA(ncclComm_t comm, const CommBParentEntry* b, int K, cuda
   const int parentRank = b->parentRank;
   const int localCacheFull = (gCommACount >= kMaxSplitCommEntries) ? 1 : 0;
   int cacheFull = 0;
-  SP_NCCLCHECK(broadcastMaxInt(comm, stream, localCacheFull, &cacheFull));
+  NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localCacheFull, &cacheFull));
   if (cacheFull) {
     NCCL_M2N_FAIL(ncclInvalidArgument, parentRank,
                   "split-comm: commA cache full (%d); refusing comm %p K=%d. Increase kMaxSplitCommEntries",
@@ -546,7 +544,7 @@ ncclResult_t ensureCommA(ncclComm_t comm, const CommBParentEntry* b, int K, cuda
       M2nApiUnlock apiUnlock;
       NCCL_M2N_CHECK(m2nWaitCommReady(commA));
     }
-    SP_NCCLCHECK(ncclCommUserRank(commA, &rankInA));
+    NCCL_M2N_CHECK(ncclCommUserRank(commA, &rankInA));
   }
 
   /* Probe commA for the SOURCE (trainer) NVL-domain size: only source
@@ -556,14 +554,14 @@ ncclResult_t ensureCommA(ncclComm_t comm, const CommBParentEntry* b, int K, cuda
   bool probeAValid = false;
   int srcLocalLsa = 0;
   if (inA && commA != nullptr) {
-    SP_NCCLCHECK(createProbeDevComm(commA, NCCLM2N_GIN_RAIL_CONNECTION, &probeDevCommA));
+    NCCL_M2N_CHECK(createProbeDevComm(commA, NCCLM2N_GIN_RAIL_CONNECTION, &probeDevCommA));
     probeAValid = true;
     if (isSrc) {
       srcLocalLsa = (probeDevCommA.lsaSize > 0) ? probeDevCommA.lsaSize : 0;
     }
   }
   int srcLsaSize = 0;
-  SP_NCCLCHECK(broadcastMaxInt(comm, stream, srcLocalLsa, &srcLsaSize));
+  NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, srcLocalLsa, &srcLsaSize));
 
   CommACacheEntry e;
   memset(&e, 0, sizeof(e));
@@ -678,8 +676,8 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
     NCCL_M2N_CHECK(m2nWaitCommReady(comm));
   }
   int parentRank = -1, parentSize = 0;
-  SP_NCCLCHECK(ncclCommUserRank(comm, &parentRank));
-  SP_NCCLCHECK(ncclCommCount(comm, &parentSize));
+  NCCL_M2N_CHECK(ncclCommUserRank(comm, &parentRank));
+  NCCL_M2N_CHECK(ncclCommCount(comm, &parentSize));
 
   const int srcStart = srcMesh->startRank;
   const int srcSize = srcMesh->dims[0] * srcMesh->dims[1];
@@ -702,7 +700,7 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
   if (pe == nullptr) {
     const int localParentCacheFull = (gCommBParentCount >= kMaxSplitCommEntries) ? 1 : 0;
     int parentCacheFull = 0;
-    SP_NCCLCHECK(broadcastMaxInt(comm, stream, localParentCacheFull, &parentCacheFull));
+    NCCL_M2N_CHECK(broadcastMaxInt(comm, stream, localParentCacheFull, &parentCacheFull));
     if (parentCacheFull) {
       NCCL_M2N_FAIL(ncclInvalidArgument, parentRank,
                     "split-comm: commB parent cache full (%d); refusing comm %p. Increase kMaxSplitCommEntries",
@@ -710,7 +708,7 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
     }
 
     /* Stage 1: commB, cached for this parent and mesh geometry. */
-    SP_NCCLCHECK(ensureCommBShared(comm, srcMesh, dstMesh, stream, &se));
+    NCCL_M2N_CHECK(ensureCommBShared(comm, srcMesh, dstMesh, stream, &se));
     if (se == nullptr) {
       out->active = false;
       out->parentComm = comm;
@@ -828,7 +826,7 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
 
   /* Stage 2: commA for this K (cached per (parent comm, K)). */
   CommACacheEntry* a = nullptr;
-  SP_NCCLCHECK(ensureCommA(comm, pe, numInjectionDomains, stream, &a));
+  NCCL_M2N_CHECK(ensureCommA(comm, pe, numInjectionDomains, stream, &a));
 
   /* PIPE uses outer partition 0; persistent control slots isolate graphs. */
   const int slotIdx = (reshardGetCopyAlgorithm() == RESHARD_COPY_ALGO_PIPE) ? 0 : getStagingBucketIndex(comm);
@@ -889,7 +887,7 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
                                                NCCL_WIN_COLL_SYMMETRIC));
         NCCL_M2N_CHECK(m2nWaitCommReady(sc->commA));
       }
-      SP_NCCLCHECK(cacheInternalWindow(sc->commA, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT,
+      NCCL_M2N_CHECK(cacheInternalWindow(sc->commA, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT,
                                        winA));
     }
     if (outWindowA != nullptr) *outWindowA = winA;
@@ -920,7 +918,7 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
                                                NCCL_WIN_COLL_SYMMETRIC));
         NCCL_M2N_CHECK(m2nWaitCommReady(sc->commB));
       }
-      SP_NCCLCHECK(cacheInternalWindow(sc->commB, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT,
+      NCCL_M2N_CHECK(cacheInternalWindow(sc->commB, stagingBuffer, stagingCapacity, RESHARD_INTERNAL_WINDOW_SPLIT,
                                        winB));
     }
     if (outWindowB != nullptr) *outWindowB = winB;

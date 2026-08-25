@@ -95,7 +95,8 @@ static inline bool m2nSameTensorTopology(const ncclDistTensor_t& a, const ncclDi
     if ((errorVar) != cudaSuccess) {                                                               \
       NCCL_M2N_SET_ERROR("CUDA operation %s failed: %s", #cmd, cudaGetErrorString(errorVar));     \
       RESHARD_WARN(-1, "%s", ncclM2nGetLastError());                                             \
-      return ncclSystemError;                                                                      \
+      (void)cudaGetLastError();                                                                    \
+      return ncclUnhandledCudaError;                                                               \
     }                                                                                              \
   } while (0)
 
