@@ -410,6 +410,13 @@ typedef struct {
     ncclEpAllocConfig_t alloc;                  // Custom device-memory allocator (zero-init → cudaMalloc/cudaFree)
     unsigned int enable_mask;                   // Enable active-mask fault tolerance (LL only)
     uint64_t timeout_ns;                        // GPU-side wait-loop timeout (0 = default)
+    ncclEpZeroCopyMode_t zero_copy;             // Window-backed staging control (AUTO / OFF / ON)
+    ncclEpOverflowPolicy_t overflow_policy;     // HT recv-overflow policy (AUTO → TRAP, or DROP);
+                                                //   see overflow_policy.md.
+    unsigned int num_topk;                      // Upper bound on per-token top-k across the group's
+                                                //   handles. Optional (0 = unset); required for HT
+                                                //   eager mode with the expert-major layout.
+    unsigned char padding_v2[4];                // Consumes V2 tail padding; future fields append after
 } ncclEpGroupConfig_t;
 
 // Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill size/magic/version correctly.
@@ -446,6 +453,26 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 - **`NCCL_EP_LAYOUT_EXPERT_MAJOR`**: dispatch output is grouped by local expert. Each expert's slice is optionally padded to a multiple of `dispatch_output_per_expert_alignment` (set via `ncclEpHandleConfig_t`).
   - Tokens arrive pre-sorted by expert; the caller feeds each expert's slice directly without needing `topk_idx` for routing.
   - Set `ncclEpLayoutInfo_t.expert_counters` (1D tensor, length = `num_local_experts`) to receive per-expert received token counts.
+
+***Recv overflow policy (HT only)***
+
+Routing is data-dependent, so a rank can be targeted by more tokens than the
+`max_recv_tokens_per_rank` budget it was created with.
+`ncclEpGroupConfig_t::overflow_policy` selects what happens then; LL ignores it.
+
+- **`NCCL_EP_OVERFLOW_TRAP`** — the zero-init default (`NCCL_EP_OVERFLOW_AUTO`
+  resolves to it). Overflow executes a device `__trap()`, which **aborts the
+  process**; it is not a recoverable `ncclResult_t`.
+- **`NCCL_EP_OVERFLOW_DROP`** — overflowing tokens are discarded and the pipeline
+  continues. `recv_total_counter` reports the true pre-drop total, so comparing it
+  against `max_recv_tokens_per_rank` tells the caller a drop occurred. Requires an
+  explicit `max_recv_tokens_per_rank` and does not let you under-size the recv
+  tensors.
+
+Overflow is detected during `ncclEpCreateHandle` / `ncclEpUpdateHandle`, not at
+dispatch. See the [Recv Overflow Policy guide](overflow_policy.md) for the two
+stages at which tokens can be dropped, the exact reported counts, and why
+`expert_counters` is an upper bound under `DROP`.
 
 **Low Latency (LL)**:
 - Supports `NCCL_EP_LAYOUT_EXPERT_MAJOR` and `NCCL_EP_LAYOUT_RANK_MAJOR` layouts.
