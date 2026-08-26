@@ -410,7 +410,8 @@ typedef struct {
     ncclEpAllocConfig_t alloc;                  // Custom device-memory allocator (zero-init → cudaMalloc/cudaFree)
     unsigned int enable_mask;                   // Enable active-mask fault tolerance (LL only)
     uint64_t timeout_ns;                        // GPU-side wait-loop timeout (0 = default)
-    ncclEpZeroCopyMode_t zero_copy;             // Window-backed staging control (AUTO / OFF / ON)
+    ncclEpZeroCopyMode_t zero_copy;             // Window-backed staging control (AUTO / OFF / ON);
+                                                //   see zero_copy.md.
     ncclEpOverflowPolicy_t overflow_policy;     // HT recv-overflow policy (AUTO → TRAP, or DROP);
                                                 //   see overflow_policy.md.
     unsigned int num_topk;                      // Upper bound on per-token top-k across the group's
@@ -453,6 +454,23 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 - **`NCCL_EP_LAYOUT_EXPERT_MAJOR`**: dispatch output is grouped by local expert. Each expert's slice is optionally padded to a multiple of `dispatch_output_per_expert_alignment` (set via `ncclEpHandleConfig_t`).
   - Tokens arrive pre-sorted by expert; the caller feeds each expert's slice directly without needing `topk_idx` for routing.
   - Set `ncclEpLayoutInfo_t.expert_counters` (1D tensor, length = `num_local_experts`) to receive per-expert received token counts.
+
+***Zero-copy staging***
+
+`ncclEpGroupConfig_t::zero_copy` controls whether payloads move through
+library-owned staging or directly through caller tensors backed by NCCL windows.
+Window-backed tensors are used directly whenever the path supports it, in **any**
+mode; `NCCL_EP_ZERO_COPY_ON` additionally makes windows mandatory and drops the
+token staging allocation. `AUTO` and `OFF` behave identically.
+
+Under `ON`, HT requires both `ncclEpDispatch` `outputs->tokens` and `ncclEpCombine`
+`inputs->tokens` to be window-backed; a plain device pointer returns
+`ncclInvalidArgument` rather than falling back to staging.
+
+`ON` also selects a different expert-major algorithm (`kNvlinkDup` or `kLocalDup`
+instead of `kLocalPermute`), so it is a performance decision, not just a memory
+one. See [Zero-Copy Staging](zero_copy.md) for the full contract, the per-tensor
+input rules, and the LL differences.
 
 ***Eager mode (HT only)***
 
@@ -506,9 +524,8 @@ stages at which tokens can be dropped, the exact reported counts, and why
   - expert-major: `[num_local_experts, num_ranks * max_dispatch_tokens_per_rank, hidden]`; `expert_counters[e]` gives the active rows for expert `e`.
   - rank-major:   `[num_ranks, max_dispatch_tokens_per_rank, hidden]`.
 - Supports `send_only` (in `ncclEpDispatchConfig_t` / `ncclEpCombineConfig_t`) to enable computation/communication overlapping.
-- With `zero_copy = NCCL_EP_ZERO_COPY_ON`, rank-major BF16 dispatch requires an
-  NVLink-only topology and a window-backed token output; unsupported cases return an error
-  instead of staging. LL combine remains staged. `AUTO` and `OFF` retain the staging fallback.
+- `zero_copy` is dispatch-only in LL; combine always stages. See
+  [Zero-Copy Staging](zero_copy.md).
 - Does not support dynamic `max_dispatch_tokens_per_rank` detection.
 
 ***`rdma_buffer_size` and lazy allocation (LL only)***
