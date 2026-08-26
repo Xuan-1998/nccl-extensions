@@ -148,5 +148,5 @@ Two constraints are easy to trip over:
    `ncclInvalidArgument` otherwise. `DROP` bounds the damage from a routing spike,
    it does not shrink the buffers.
 2. **`DROP` requires an explicit `max_recv_tokens_per_rank`.** It is incompatible
-   with HT eager mode (`max_recv_tokens_per_rank = NCCL_EP_AUTO`), which relies on
+   with [HT eager mode](eager_mode.md) (`max_recv_tokens_per_rank = NCCL_EP_AUTO`), which relies on
    trap semantics, and `ncclEpCreateGroup` rejects the combination.

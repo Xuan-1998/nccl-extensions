@@ -415,7 +415,8 @@ typedef struct {
                                                 //   see overflow_policy.md.
     unsigned int num_topk;                      // Upper bound on per-token top-k across the group's
                                                 //   handles. Optional (0 = unset); required for HT
-                                                //   eager mode with the expert-major layout.
+                                                //   eager mode with the expert-major layout;
+                                                //   see eager_mode.md.
     unsigned char padding_v2[4];                // Consumes V2 tail padding; future fields append after
 } ncclEpGroupConfig_t;
 
@@ -445,14 +446,34 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 
 - **`NCCL_EP_LAYOUT_FLAT`**: dispatch output is a contiguous 2D sequence `[N(r) x hidden]` where `N(r)` is the total number of tokens targeting this rank.
   - Static allocation: the output buffers are pre-allocated with capacity for `max_recv_tokens_per_rank` tokens. Required under CUDA Graph capture.
-  - Query-then-allocate: supply `ncclEpLayoutInfo_t.recv_total_counter` to `ncclEpCreateHandle` / `ncclEpUpdateHandle`; the metadata kernel writes the actual N(r) there, and the caller copies it device-to-host and synchronizes before allocating. The count is readable in any mode; to size the dispatch outputs to it rather than to the worst case, the group must also be created with `max_recv_tokens_per_rank = NCCL_EP_AUTO`.
-  - **OOM with `NCCL_EP_AUTO`**: `NCCL_EP_AUTO` still sizes library-internal HT buffers to the theoretical worst case `nRanks × max_dispatch_tokens_per_rank × topk`. User recv tensors can be query-sized, but a GPU OOM during `ncclEpCreateGroup` usually means that internal budget is too large — set an explicit `max_recv_tokens_per_rank` to a measured peak instead.
+  - Query-then-allocate: supply `ncclEpLayoutInfo_t.recv_total_counter` to `ncclEpCreateHandle` / `ncclEpUpdateHandle`; the metadata kernel writes the actual N(r) there, and the caller copies it device-to-host and synchronizes before allocating. The count is readable in any mode; to size the dispatch outputs to it rather than to the worst case, create the group in eager mode (see below).
   - `dispatch_outputs.topk_idx` and `dispatch_outputs.topk_weights` carry per-slot routing metadata alongside the received tokens.
   - The caller uses `topk_idx` to route each slot to the correct local expert(s), applies the weighted reduction using `topk_weights`, and passes the pre-reduced `[N(r) x hidden]` tensor as `combine_inputs.tokens` to `ncclEpCombine`.
 
 - **`NCCL_EP_LAYOUT_EXPERT_MAJOR`**: dispatch output is grouped by local expert. Each expert's slice is optionally padded to a multiple of `dispatch_output_per_expert_alignment` (set via `ncclEpHandleConfig_t`).
   - Tokens arrive pre-sorted by expert; the caller feeds each expert's slice directly without needing `topk_idx` for routing.
   - Set `ncclEpLayoutInfo_t.expert_counters` (1D tensor, length = `num_local_experts`) to receive per-expert received token counts.
+
+***Eager mode (HT only)***
+
+Creating the group with `max_recv_tokens_per_rank = NCCL_EP_AUTO` selects *eager
+mode*: instead of sizing every dispatch recv tensor to a fixed worst-case budget,
+the caller sizes them to the actual recv count of the current routing, read from
+`ncclEpLayoutInfo_t.recv_total_counter`.
+
+The worst case does not disappear — the library still derives
+`nRanks × max_dispatch_tokens_per_rank × max(num_topk, 1)` to size its **internal**
+buffers. A GPU OOM at `ncclEpCreateGroup` under `NCCL_EP_AUTO` usually means that
+derived budget is too large; set `max_recv_tokens_per_rank` explicitly to a
+measured peak instead.
+
+Eager mode requires `ncclEpGroupConfig_t::num_topk` with the expert-major layout.
+
+It is not compatible with CUDA Graph capture of `ncclEpDispatch` and
+drop-on-overflow policy (see `NCCL_EP_OVERFLOW_DROP`).
+
+See the [Eager Mode guide](eager_mode.md) for the sizing
+protocol, per-layout differences, and a comparison against a fixed budget.
 
 ***Recv overflow policy (HT only)***
 
