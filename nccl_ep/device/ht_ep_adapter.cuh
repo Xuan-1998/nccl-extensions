@@ -59,13 +59,13 @@ void convert_topk_to_routing_map(
 
 // Pull dispatch: order-preserving alternative to the bitmap routing map. Emits each
 // token's top-k global expert ids as uint16 (row stride = num_topk), kTopkIdxInvalid
-// for empty slots and tail rows [num_tokens, max_tokens). cached_topk_idx mirrors
-// topk_idx in its native width (int32/int64), as in convert_topk_to_routing_map.
+// for empty slots and tail rows [num_tokens, max_tokens). cached_topk_idx mirrors the
+// uint16 output into a handle-local snapshot for push combine; nullable.
 template <typename TopkIdxT>
 void pack_topk_idx(
     const TopkIdxT* topk_idx,
     uint16_t* topk_idx_u16,
-    TopkIdxT* cached_topk_idx,
+    uint16_t* cached_topk_idx,
     int num_tokens,
     int max_tokens,
     int num_topk,

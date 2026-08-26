@@ -116,25 +116,30 @@ convert_topk_to_routing_map<int64_t>(const int64_t*, uint8_t*, int64_t*, int, in
 // over max_tokens rows ships clean tails.
 template <typename TopkIdxT>
 __global__ void pack_topk_idx_kernel(
-    const TopkIdxT* __restrict__ topk_idx,   // [num_tokens, num_topk]
-    uint16_t* __restrict__ topk_idx_u16,           // [max_tokens, num_topk]
-    TopkIdxT* __restrict__ cached_topk_idx,  // [num_tokens, num_topk]; nullable
+    const TopkIdxT* __restrict__ topk_idx,     // [num_tokens, num_topk]
+    uint16_t* __restrict__ topk_idx_u16,       // [max_tokens, num_topk]
+    uint16_t* __restrict__ cached_topk_idx,    // [max_tokens, num_topk]; nullable
     int num_tokens,
-    int max_tokens,                          // tail-fill bound (>= num_tokens)
+    int max_tokens,                            // tail-fill bound (>= num_tokens)
     int num_topk) {
     int token = blockIdx.x * blockDim.x + threadIdx.x;
     if (token >= max_tokens) return;
-    uint16_t* out = topk_idx_u16 + static_cast<size_t>(token) * num_topk;
+    const size_t row_off = static_cast<size_t>(token) * num_topk;
+    uint16_t* out = topk_idx_u16 + row_off;
+    uint16_t* out_cache = cached_topk_idx ? cached_topk_idx + row_off : nullptr;
     if (token >= num_tokens) {
-        for (int k = 0; k < num_topk; k++) out[k] = kTopkIdxInvalid;
+        for (int k = 0; k < num_topk; k++) {
+            out[k] = kTopkIdxInvalid;
+            if (out_cache) out_cache[k] = kTopkIdxInvalid;
+        }
         return;
     }
-    const TopkIdxT* in_row = topk_idx + static_cast<size_t>(token) * num_topk;
-    TopkIdxT* cache_row = cached_topk_idx ? cached_topk_idx + static_cast<size_t>(token) * num_topk : nullptr;
+    const TopkIdxT* in_row = topk_idx + row_off;
     for (int k = 0; k < num_topk; k++) {
         TopkIdxT expert = in_row[k];
-        if (cache_row) cache_row[k] = expert;
-        out[k] = (expert >= 0) ? static_cast<uint16_t>(expert) : kTopkIdxInvalid;
+        const uint16_t u = (expert >= 0) ? static_cast<uint16_t>(expert) : kTopkIdxInvalid;
+        out[k] = u;
+        if (out_cache) out_cache[k] = u;
     }
 }
 
@@ -142,7 +147,7 @@ template <typename TopkIdxT>
 void pack_topk_idx(
     const TopkIdxT* topk_idx,
     uint16_t* topk_idx_u16,
-    TopkIdxT* cached_topk_idx,
+    uint16_t* cached_topk_idx,
     int num_tokens,
     int max_tokens,
     int num_topk,
@@ -153,8 +158,8 @@ void pack_topk_idx(
         topk_idx, topk_idx_u16, cached_topk_idx, num_tokens, max_tokens, num_topk);
 }
 
-template void pack_topk_idx<int32_t>(const int32_t*, uint16_t*, int32_t*, int, int, int, cudaStream_t);
-template void pack_topk_idx<int64_t>(const int64_t*, uint16_t*, int64_t*, int, int, int, cudaStream_t);
+template void pack_topk_idx<int32_t>(const int32_t*, uint16_t*, uint16_t*, int, int, int, cudaStream_t);
+template void pack_topk_idx<int64_t>(const int64_t*, uint16_t*, uint16_t*, int, int, int, cudaStream_t);
 
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob

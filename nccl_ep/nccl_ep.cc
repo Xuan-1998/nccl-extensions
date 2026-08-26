@@ -2440,8 +2440,9 @@ struct ncclEpHandle {
             int emuf_group_stride;
             int emuf_max_groups;
 
-            // Cached user topk_idx; persists across dispatch/combine.
-            // Native width matches handle->topk_idx.datatype (int32 or int64).
+            // Cached per-rank topk_idx [max_tokens, num_topk], persists across dispatch/combine.
+            // Width: int32/int64 (native) outside kPullPush; uint16 snapshot under kPullPush
+            // so push combine reads a handle-private slot instead of ht_buffers.global_topk_idx.
             void* topk_idx;
 
             // FLAT-dispatch + local-permute scratch (EM-permute path only).
@@ -2551,7 +2552,7 @@ struct HtBlockLayout {
     // global_routing_map is group-scoped (ep_group->ht_buffers); not part of this block.
     size_t sz_r2a, sz_a2r, sz_ler, sz_ntfe;
     size_t sz_s2d, sz_rank_mask, sz_scan_tmp, sz_prob;
-    size_t sz_topk_idx; // cached topk_idx
+    size_t sz_topk_idx; // cached topk_idx (uint16 under pull-push, native int64 elsewhere)
     size_t sz_pec_active; // EM only
     size_t sz_eto; // EM only
     // Local-dup local-fanout scratch.
@@ -2612,7 +2613,10 @@ struct HtBlockLayout {
         L.sz_prob = (!is_internode_available(ep_group) && !needs_pull_buffers) ?
                         align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) :
                         0;
-        L.sz_topk_idx = (num_topk > 0) ? align256(static_cast<size_t>(max_tokens) * num_topk * sizeof(int64_t)) : 0;
+        // Pull-push stores a uint16 snapshot for push combine; other modes cache the native
+        // int32/int64 for the FLAT dense-prob rebuild and BWD dense-to-sparse scatter.
+        const size_t topk_idx_elem = needs_pull_buffers ? sizeof(uint16_t) : sizeof(int64_t);
+        L.sz_topk_idx = (num_topk > 0) ? align256(static_cast<size_t>(max_tokens) * num_topk * topk_idx_elem) : 0;
         L.sz_pec_active = has_expert_major ? align256(static_cast<size_t>(experts_per_rank) * sizeof(int32_t)) : 0;
         // [experts_per_rank + 1]: em_scan_kernel publishes the EM-padded total at `experts_per_rank` index.
         L.sz_eto = has_expert_major ? align256(static_cast<size_t>(experts_per_rank + 1) * sizeof(int64_t)) : 0;
@@ -3193,8 +3197,9 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     // Pull dispatch: produce + gather the order-preserving uint16 topk map (row stride =
-    // num_topk); the pull scan consumes this instead of the bitmap. Also caches topk_idx
-    // (native width) for combine BWD, since the bitmap convert is skipped under pull.
+    // num_topk); the pull scan consumes this instead of the bitmap. The pack kernel also
+    // writes a handle-local snapshot into handle->ht.topk_idx for push combine (see its
+    // field comment).
     if (use_topk_idx_scan) {
         EP_HOST_ASSERT(handle->num_topk <= MAX_NUM_TOPK);
         // uint16 topk map: expert ids are packed as uint16, and kTopkIdxInvalid
@@ -3203,15 +3208,15 @@ ncclResult_t ncclEpUpdateHandle(
         const size_t topk_idx_rank_stride = static_cast<size_t>(max_tokens) * handle->num_topk;
         uint16_t* topk_idx_send_ptr =
             ep_group->ht_buffers.global_topk_idx + topk_idx_rank_stride * ep_group->rank;
+        assert(handle->ht.topk_idx != nullptr);
+        uint16_t* topk_idx_snapshot = static_cast<uint16_t*>(handle->ht.topk_idx);
         if (handle->topk_idx.datatype == ncclInt32) {
             nccl_ep::ht::pack_topk_idx(
-                static_cast<const int32_t*>(handle->topk_idx.data), topk_idx_send_ptr,
-                static_cast<int32_t*>(handle->ht.topk_idx),
+                static_cast<const int32_t*>(handle->topk_idx.data), topk_idx_send_ptr, topk_idx_snapshot,
                 handle->num_tokens, max_tokens, handle->num_topk, stream);
         } else {
             nccl_ep::ht::pack_topk_idx(
-                static_cast<const int64_t*>(handle->topk_idx.data), topk_idx_send_ptr,
-                static_cast<int64_t*>(handle->ht.topk_idx),
+                static_cast<const int64_t*>(handle->topk_idx.data), topk_idx_send_ptr, topk_idx_snapshot,
                 handle->num_tokens, max_tokens, handle->num_topk, stream);
         }
         // AllGather moves raw bytes; NCCL has no uint16 type, so ship as uint8.
@@ -5071,13 +5076,16 @@ ncclResult_t ncclEpCombine(
             const int team_size = group->lsa_team_size;
             void* staging = group->ht_buffers.expert_input_token;
             // Which (t,R) partials exist is derived locally in the reduce from this rank's
-            // own routing (uint16 topk gathered during dispatch), so no per-(t,R) valid
-            // flag is pushed over NVLink and no flag zero-init is needed. Unwritten staging
-            // rows are still skipped, so the full staging memset is avoided.
-            const uint16_t* self_topk_idx =
-                group->ht_buffers.global_topk_idx +
-                static_cast<size_t>(group->config.max_dispatch_tokens_per_rank) * handle->num_topk *
-                    group->rank;
+            // own routing (per-handle uint16 topk snapshot), so no per-(t,R) valid flag is
+            // pushed over NVLink and no flag zero-init is needed. Unwritten staging rows
+            // are still skipped, so the full staging memset is avoided.
+            assert(handle->ht.topk_idx != nullptr &&
+                   "HT push combine: topk_idx snapshot missing (ncclEpUpdateHandle not called?)");
+            const uint16_t* self_topk_idx = static_cast<const uint16_t*>(handle->ht.topk_idx);
+            // TODO(em-pp): forward combine_reduce could read present_ranks straight from
+            // this rank's slice of handle->ht.token_rank_mask and skip the per-lane topk
+            // decode + __match_any_sync dedup entirely; backward still needs the per-lane
+            // src_rank_of_lane for the srcpos pad lookup.
             if (backward_combine) {
                 // The reduce writes combined_topk_weights with stride handle->num_topk.
                 assert(num_topk == handle->num_topk &&
