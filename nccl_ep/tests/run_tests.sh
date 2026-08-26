@@ -95,6 +95,8 @@ SUITES=(
     "test_public_struct_abi|EP Public Struct ABI Tests|0"
     "test_ht_bwd|EP HT Backward Tests|1"
     "test_ht_stale_routing_map|EP HT Stale Routing Map Tests|1"
+    "test_ht_combine_pp_interleave|EP HT Combine PP Interleave Tests|1"
+    "test_ht_dispatch_pp_interleave|EP HT Dispatch PP Interleave Tests|1"
     "test_ht_overflow_drop|EP HT Overflow Drop Tests|0"
     "test_tensor_create|EP Tensor Create Tests|0"
     "test_quantization_recipe|EP Quantization Recipe Tests|1"
@@ -124,7 +126,7 @@ done
 # Pull-dispatch / push-combine (single NVLink LSA team, expert-major only). Restricted to the
 # suites with expert-major dispatch/combine coverage; the non-expert-major cases in them skip
 # via SKIP_IF_PULL_PUSH. All ranks form one LSA team so the push combine's single-team path runs.
-PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe"
+PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe test_ht_combine_pp_interleave test_ht_dispatch_pp_interleave"
 export NCCL_EP_HT_EM_PULL_PUSH=1
 export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
 for entry in "${SUITES[@]}"; do
