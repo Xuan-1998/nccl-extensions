@@ -26,6 +26,7 @@ implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initi
 **Guides**
 
 - [API Reference](api_reference.md) — every public entry point
+- [JIT Kernel Compilation](jit.md) — runtime `nvcc` knobs, paths, and cache
 - [Quantization](quantization.md) — dispatch and combine recipes
 - [Zero-Copy Staging](zero_copy.md) — window-backed direct paths
 - [Recv Overflow Policy](overflow_policy.md) — HT trap / drop behavior
@@ -278,7 +279,15 @@ export NCCL_DEBUG=INFO        # Enable NCCL debug output
 export NCCL_DEBUG_SUBSYS=ALL  # All subsystems
 export NCCL_EP_DEBUG=1        # NCCL-EP diagnostics, including zero-copy selection and fallback reasons
 export NCCL_EP_ENV_VERBOSE=true  # Resolved NCCL-EP environment at group creation
+export NCCL_EP_JIT_LOG=1      # Runtime kernel-compilation diagnostics (see jit.md)
 ```
+
+> **Runtime kernel compilation.** NCCL EP compiles some device kernels on first
+> use, so a deployment needs a reachable `nvcc`, the kernel/NCCL/CUDA headers, and
+> a writable cache directory (default `/tmp/nccl_ep/jit`). A build that stays
+> where it was built needs no configuration; relocated installs, wheels,
+> containers, and read-only filesystems do. See
+> [JIT Kernel Compilation](jit.md) for every knob, including `NCCL_EP_HOME`.
 
 ### High-Throughput tuning
 
