@@ -16,6 +16,17 @@ Options (identical to ep_test.cu):
     -r                                   Enable random mode
     -t NUM                               Number of tokens (default: 50)
     -d NUM                               Hidden dimension size (default: 7168)
+    -Q, --quant                          Quantization smoke test (see below)
+
+Quantization smoke test (-Q):
+    Exercises the scales-forwarding dispatch recipe on a fixed, fully
+    deterministic configuration. Only -a is honoured; -s/-c/-r/-t/-d are
+    ignored. Dispatch only -- combine is not run.
+
+    Wire types match ep_bench's
+        --dispatch-quantization scales-forward
+        --scales-forward-token-dtype fp8e4m3 --scales-forward-scale-dtype fp32
+    i.e. fp8e4m3 tokens [128, 7168] and fp32 scales [128, 56].
 """
 
 from __future__ import annotations
@@ -110,6 +121,7 @@ _DTYPE_BYTES = {
     nccl_core.FLOAT16: 2,
     nccl_core.BFLOAT16: 2,
     nccl_core.FLOAT32: 4,
+    nccl_core.FLOAT8E4M3: 1,
 }
 
 
@@ -156,6 +168,353 @@ def float_to_bf16(f: float) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Quantization smoke test (-Q)
+#
+# Fixed configuration, deterministic routing: every rank sends
+# QUANT_NUM_TOKENS tokens and routes all of them to a single global expert,
+# so the one rank owning that expert receives the whole job's tokens and
+# every other rank receives none. Dispatch runs under the scales-forwarding
+# recipe, which byte-forwards the token payload and its companion scale row.
+#
+# Slot order inside an expert's zone is NOT deterministic (LL assigns slots
+# with an atomicAdd, HT documents its zone as "internal ordering"), and
+# expert-major populates no recv_topk_idx, so a received row cannot be
+# identified by position. Every row therefore carries its own identity and
+# verification is content-addressed: decode (src_rank, token) from the token
+# payload, then require the *paired* scale row to carry the same identity.
+# That is what actually proves a row's scales travelled with the row.
+# ---------------------------------------------------------------------------
+
+QUANT_NUM_TOKENS = 128
+QUANT_HIDDEN = 7168
+QUANT_TOP_K = 2
+QUANT_SCALE_BLOCK = 128  # one scale element per 128 token elements
+QUANT_TARGET_EXPERT = 0  # every token routes here; its owner receives everything
+# Wire types, matching ep_bench's
+#   --dispatch-quantization scales-forward
+#   --scales-forward-token-dtype fp8e4m3 --scales-forward-scale-dtype fp32
+# FP8 is one byte per element and is NOT dimension-packed (only fp4x2 halves
+# the hidden dim), so the physical token shape stays [B, hidden].
+QUANT_TOKEN_ELEM_BYTES = 1  # fp8e4m3
+QUANT_SCALE_ELEM_BYTES = 4  # fp32
+
+
+def _quant_global_ids(src_rank: int) -> np.ndarray:
+    """Globally unique ids for one rank's tokens: rank-major, contiguous."""
+    return src_rank * QUANT_NUM_TOKENS + np.arange(QUANT_NUM_TOKENS, dtype=np.int64)
+
+
+def _quant_token_rows(gids: np.ndarray, hidden: int) -> np.ndarray:
+    """[N, hidden] uint8 fp8e4m3 wire bytes; bytes 0..2 tag the row's identity.
+
+    Mirrors the byte pattern ep_bench.cu uses for this recipe
+    (``scalesForwardTokenByte``): rank in byte 0, token index in bytes 1..2,
+    a per-element hash after that. The recipe forwards physical bytes, so the
+    payload is opaque and compared byte-exactly -- byte values that happen to
+    be FP8 NaN are harmless because nothing interprets them numerically.
+    """
+    gids = np.asarray(gids, dtype=np.int64)
+    ranks = gids // QUANT_NUM_TOKENS
+    tokens = gids % QUANT_NUM_TOKENS
+    j = np.arange(hidden, dtype=np.int64)
+    rows = ((ranks[:, None] * 131 + tokens[:, None] * 17 + j[None, :]) & 0xFF).astype(np.uint8)
+    rows[:, 0] = ranks.astype(np.uint8)            # source rank
+    rows[:, 1] = (tokens // 256).astype(np.uint8)  # token index, high byte
+    rows[:, 2] = (tokens % 256).astype(np.uint8)   # token index, low byte
+    return rows
+
+
+def _quant_scale_rows(gids: np.ndarray, scales_per_token: int) -> np.ndarray:
+    """[N, S] float32 scales keyed to the same identity as the token row.
+
+    Integer-valued and well under 2**24, so every entry is exact in FP32 and
+    equality comparison is safe.
+    """
+    gids = np.asarray(gids, dtype=np.int64)
+    s = np.arange(scales_per_token, dtype=np.int64)
+    return (gids[:, None] * 64 + s[None, :]).astype(np.float32)
+
+
+def _quant_decode_ids(token_rows: np.ndarray, n_ranks: int) -> tuple[np.ndarray, np.ndarray]:
+    """Recover (tag_ok, global_id) per received row from its own payload.
+
+    A row whose tag is out of range never came from this job -- an untouched
+    or garbage slot -- so it is reported before the payload comparison.
+    """
+    ranks = token_rows[:, 0].astype(np.int64)
+    tokens = token_rows[:, 1].astype(np.int64) * 256 + token_rows[:, 2].astype(np.int64)
+    tag_ok = (ranks < n_ranks) & (tokens < QUANT_NUM_TOKENS)
+    return tag_ok, ranks * QUANT_NUM_TOKENS + tokens
+
+
+def run_quant_smoke_test(comm, stream, my_rank: int, n_ranks: int, algorithm) -> None:
+    """Dispatch-only smoke + correctness test for the scales-forwarding recipe."""
+    is_ll = algorithm == nccl_ep.Algorithm.LOW_LATENCY
+    hidden = QUANT_HIDDEN
+    num_tokens = QUANT_NUM_TOKENS
+    top_k = QUANT_TOP_K
+    scales_per_token = hidden // QUANT_SCALE_BLOCK
+
+    num_experts = min(256, top_k * n_ranks)
+    if num_experts % n_ranks != 0:
+        if my_rank == 0:
+            print(f"Error: num_experts ({num_experts}) must be divisible by nRanks ({n_ranks})")
+        sys.exit(1)
+    num_local_experts = num_experts // n_ranks
+
+    # Global expert QUANT_TARGET_EXPERT lives on exactly one rank; that rank
+    # receives every token in the job and all others receive none.
+    local_target = QUANT_TARGET_EXPERT - my_rank * num_local_experts
+    is_owner = 0 <= local_target < num_local_experts
+
+    # Three distinct row counts, easy to conflate:
+    #
+    #  recv_budget   worst-case recv SLOTS per rank. Expert-major expands a
+    #                token to one slot per local expert it targets, so the
+    #                budget carries a top_k factor. HT enforces this:
+    #                ncclEpInitHandle asserts
+    #                max_recv_tokens >= nRanks * max_dispatch * num_topk for
+    #                em_slot staging, and dispatch requires the recv tensor to
+    #                cover the full budget under fixed sizing.
+    #  ll_zone_rows  LL expert-major's per-expert zone stride, which the kernel
+    #                fixes at nRanks * max_dispatch_tokens_per_rank with no
+    #                top_k factor (see the layout contract in ep_enums.h).
+    #  expected_recv rows this particular routing actually delivers. Every
+    #                token names one real expert (slot 1 is -1), so it is one
+    #                row per token -- well under the budget.
+    recv_budget = num_tokens * n_ranks * top_k
+    ll_zone_rows = num_tokens * n_ranks
+    expected_recv = num_tokens * n_ranks if is_owner else 0
+
+    # Physical row sizes, used below to offset into the recv tensors.
+    token_bytes = hidden * QUANT_TOKEN_ELEM_BYTES            # fp8e4m3 payload
+    scale_bytes = scales_per_token * QUANT_SCALE_ELEM_BYTES  # fp32 scales
+
+    # max_token_bytes is an upper bound on one token row including its scales,
+    # not an exact fit. Size it to the unquantized bf16 envelope, as ep_bench
+    # does (it takes max(hidden * token_dtype_bytes, recipe_payload_bytes)), so
+    # the group is configured for the model's native token width and the
+    # quantized fp8 + scales payload simply fits inside it.
+    max_token_bytes = QUANT_HIDDEN * 2
+    assert max_token_bytes >= token_bytes + scale_bytes, "budget must cover tokens + scales"
+    # Each physical row, and the HT budget, must be 16-byte aligned (quantization.md).
+    assert token_bytes % 16 == 0, "token row must be 16-byte aligned"
+    assert scale_bytes % 16 == 0, "scale row must be 16-byte aligned"
+    assert max_token_bytes % 16 == 0, "max_token_bytes must be 16-byte aligned for HT"
+
+    algorithm_name = "LOW_LATENCY" if is_ll else "HIGH_THROUGHPUT"
+    if my_rank == 0:
+        print(f"Quantization smoke test: algorithm={algorithm_name}, layout=EXPERT_MAJOR, "
+              f"recipe=scales-forward, tokens=fp8e4m3, scales=fp32, "
+              f"tokens={num_tokens}, hidden={hidden}, top_k={top_k}, "
+              f"scales/token={scales_per_token}, experts={num_experts}, "
+              f"max_token_bytes={max_token_bytes}")
+
+    config = nccl_ep.GroupConfig(
+        algorithm=algorithm,
+        num_experts=num_experts,
+        max_dispatch_tokens_per_rank=num_tokens,
+        max_recv_tokens_per_rank=recv_budget,
+        max_token_bytes=max_token_bytes,
+        num_topk=top_k,
+        alloc=nccl_ep.AllocConfig(alloc_fn=_ALLOC_FN_ADDR, free_fn=_FREE_FN_ADDR),
+    )
+    ep_group = nccl_ep.Group.create(comm, config)
+
+    # -- routing: slot 0 -> the target expert, slot 1 unused ----------------
+    # A negative entry marks an unused top-k slot; both backends skip it.
+    topk_idx = make_tensor(2, nccl_core.INT64, num_tokens, top_k)
+    topk_idx_host = np.full((num_tokens, top_k), -1, dtype=np.int64)
+    topk_idx_host[:, 0] = QUANT_TARGET_EXPERT
+    h2d(topk_idx.data, topk_idx_host, stream)
+
+    # -- inputs -------------------------------------------------------------
+    input_tokens = make_tensor(2, nccl_core.FLOAT8E4M3, num_tokens, hidden)
+    input_scales = make_tensor(2, nccl_core.FLOAT32, num_tokens, scales_per_token)
+    topk_weights = make_tensor(2, nccl_core.FLOAT32, num_tokens, top_k)
+
+    gids = _quant_global_ids(my_rank)
+    h2d(input_tokens.data, _quant_token_rows(gids, hidden), stream)
+    h2d(input_scales.data, _quant_scale_rows(gids, scales_per_token), stream)
+    tw_host = np.zeros((num_tokens, top_k), dtype=np.float32)
+    tw_host[:, 0] = 1.0  # the unused slot's weight is never read
+    h2d(topk_weights.data, tw_host, stream)
+
+    # -- outputs ------------------------------------------------------------
+    # LL expert-major is 3D [num_local_experts, ll_zone_rows, ...] -- the zone
+    # stride the kernel assumes. HT is 2D over recv slots and must cover the
+    # whole budget. Scales mirror the token tensor's leading dimensions with S
+    # as the final one.
+    expert_counters = recv_total = output_topk_weights = None
+    if is_ll:
+        output_tokens = make_tensor(3, nccl_core.FLOAT8E4M3, num_local_experts, ll_zone_rows, hidden)
+        output_scales = make_tensor(3, nccl_core.FLOAT32, num_local_experts, ll_zone_rows, scales_per_token)
+        expert_counters = make_tensor(1, nccl_core.INT32, num_local_experts)
+    else:
+        output_tokens = make_tensor(2, nccl_core.FLOAT8E4M3, recv_budget, hidden)
+        output_scales = make_tensor(2, nccl_core.FLOAT32, recv_budget, scales_per_token)
+        # HT expert-major forward dispatch requires a 1D weight per recv slot.
+        output_topk_weights = make_tensor(1, nccl_core.FLOAT32, recv_budget)
+        recv_total = make_tensor(1, nccl_core.INT32, 1)
+
+    # -- handle -------------------------------------------------------------
+    handle_layout_info = None if is_ll else nccl_ep.LayoutInfo(
+        recv_total_counter=recv_total.tensor,
+    )
+    ep_handle = ep_group.create_handle(
+        nccl_ep.Layout.EXPERT_MAJOR, topk_idx.tensor,
+        layout_info=handle_layout_info,
+        config=nccl_ep.HandleConfig(),  # alignment 0 -> unpadded expert zones
+        stream=stream,
+    )
+    stream.sync()
+
+    # -- dispatch -----------------------------------------------------------
+    # round_scales must stay 0 under the scales-forwarding recipe.
+    dispatch_config = nccl_ep.DispatchConfig(
+        send_only=0,
+        round_scales=0,
+        quantization_recipe=nccl_ep.DispatchQuantizationRecipe.FWD,
+    )
+    if is_ll:
+        dispatch_inputs = nccl_ep.DispatchInputs(
+            tokens=input_tokens.tensor,
+            scales=input_scales.tensor,
+        )
+        dispatch_outputs = nccl_ep.DispatchOutputs(
+            tokens=output_tokens.tensor,
+            scales=output_scales.tensor,
+        )
+        dispatch_layout = nccl_ep.LayoutInfo(expert_counters=expert_counters.tensor)
+    else:
+        dispatch_inputs = nccl_ep.DispatchInputs(
+            tokens=input_tokens.tensor,
+            topk_weights=topk_weights.tensor,
+            scales=input_scales.tensor,
+        )
+        dispatch_outputs = nccl_ep.DispatchOutputs(
+            tokens=output_tokens.tensor,
+            topk_weights=output_topk_weights.tensor,
+            scales=output_scales.tensor,
+        )
+        dispatch_layout = None
+
+    print(f"Rank {my_rank}: Testing quantized dispatch (scales forwarding)")
+    ep_handle.dispatch(
+        dispatch_inputs, dispatch_outputs,
+        layout_info=dispatch_layout,
+        config=dispatch_config,
+        stream=stream,
+    )
+    ep_handle.complete(stream=stream)
+    stream.sync()
+
+    # -- how many rows actually landed --------------------------------------
+    errors: list[str] = []
+    if is_ll:
+        counts_host = np.empty(num_local_experts, dtype=np.int32)
+        d2h(counts_host, expert_counters.data, stream)
+        stream.sync()
+        n_valid = int(counts_host[local_target]) if is_owner else 0
+        for e in range(num_local_experts):
+            if e == local_target:
+                continue
+            if int(counts_host[e]) != 0:
+                errors.append(f"local expert {e} received {int(counts_host[e])} tokens, expected 0")
+    else:
+        total_host = np.empty(1, dtype=np.int32)
+        d2h(total_host, recv_total.data, stream)
+        stream.sync()
+        n_valid = int(total_host[0])
+
+    if n_valid != expected_recv:
+        errors.append(f"recv count is {n_valid}, expected {expected_recv}")
+
+    # -- content-addressed verification of the received rows ----------------
+    # Both layouts place the target expert's rows contiguously from the start
+    # of its zone; expert 0 is the first zone, and no alignment padding was
+    # requested, so the zone base is row 0 of the tensor.
+    zone_capacity = ll_zone_rows if is_ll else recv_budget
+    n_check = min(n_valid, zone_capacity)
+    if is_owner and n_check > 0:
+        zone_row = local_target * ll_zone_rows if is_ll else 0
+        token_rows = np.empty((n_check, hidden), dtype=np.uint8)
+        scale_rows = np.empty((n_check, scales_per_token), dtype=np.float32)
+        d2h(token_rows, output_tokens.data + zone_row * token_bytes, stream)
+        d2h(scale_rows, output_scales.data + zone_row * scale_bytes, stream)
+        stream.sync()
+
+        tag_ok, gids_seen = _quant_decode_ids(token_rows, n_ranks)
+        bad_tags = np.flatnonzero(~tag_ok)
+        for row in bad_tags[:5]:
+            errors.append(
+                f"row {int(row)} has an out-of-range identity tag "
+                f"(rank byte {int(token_rows[row, 0])}, token bytes "
+                f"{int(token_rows[row, 1])}/{int(token_rows[row, 2])})"
+            )
+
+        # Full-row payload check against the identity the row claims.
+        expected_tokens = _quant_token_rows(gids_seen, hidden)
+        bad_tokens = np.flatnonzero((token_rows != expected_tokens).any(axis=1))
+        for row in bad_tokens[:5]:
+            col = int(np.flatnonzero(token_rows[row] != expected_tokens[row])[0])
+            errors.append(
+                f"token payload mismatch at row {int(row)} (gid {int(gids_seen[row])}) "
+                f"byte {col}: expected 0x{int(expected_tokens[row, col]):02x}, "
+                f"got 0x{int(token_rows[row, col]):02x}"
+            )
+
+        # The pairing proof: the scale row must carry the identity that the
+        # token row claims, not merely some valid identity.
+        expected_scales = _quant_scale_rows(gids_seen, scales_per_token)
+        bad_scales = np.flatnonzero((scale_rows != expected_scales).any(axis=1))
+        for row in bad_scales[:5]:
+            col = int(np.flatnonzero(scale_rows[row] != expected_scales[row])[0])
+            errors.append(
+                f"scales not paired with their token at row {int(row)} "
+                f"(token claims gid {int(gids_seen[row])}) element {col}: "
+                f"expected {float(expected_scales[row, col])}, got {float(scale_rows[row, col])}"
+            )
+
+        # Completeness: exactly one row per (source rank, token), no gaps or
+        # duplicates.
+        if not np.array_equal(np.sort(gids_seen), np.arange(expected_recv, dtype=np.int64)):
+            seen = set(int(g) for g in gids_seen)
+            missing = sorted(set(range(expected_recv)) - seen)
+            errors.append(
+                f"received token set is wrong: {len(seen)} distinct of {expected_recv} expected"
+                + (f", first missing gid {missing[0]}" if missing else "")
+            )
+
+    if errors:
+        print(f"Rank {my_rank}: Quantization verification FAILED ({len(errors)} problems)")
+        for message in errors[:10]:
+            print(f"Rank {my_rank}:   {message}")
+    else:
+        print(f"Rank {my_rank}: Quantization verification PASSED "
+              f"({n_valid} rows, tokens and scales paired)")
+
+    # -- cleanup ------------------------------------------------------------
+    free_tensor(topk_idx)
+    free_tensor(input_tokens)
+    free_tensor(input_scales)
+    free_tensor(topk_weights)
+    free_tensor(output_tokens)
+    free_tensor(output_scales)
+    free_tensor(expert_counters)
+    free_tensor(output_topk_weights)
+    free_tensor(recv_total)
+
+    ep_handle.destroy()
+    ep_group.destroy()
+    comm.destroy()
+
+    if errors:
+        sys.exit(1)
+    print(f"[MPI Rank {my_rank}] Success ")
+
+
+# ---------------------------------------------------------------------------
 # Main test
 # ---------------------------------------------------------------------------
 
@@ -172,9 +531,19 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     parser.add_argument("-r", action="store_true", help="Enable random mode")
     parser.add_argument("-t", type=int, default=50, help="Number of tokens")
     parser.add_argument("-d", type=int, default=7168, help="Hidden dimension size")
+    parser.add_argument("-Q", "--quant", action="store_true",
+                        help="Quantization smoke test (scales forwarding); only -a is honoured")
     args = parser.parse_args()
 
     algorithm = nccl_ep.Algorithm.LOW_LATENCY if args.a == "ll" else nccl_ep.Algorithm.HIGH_THROUGHPUT
+    quant_mode = args.quant
+    if quant_mode and my_rank == 0:
+        ignored = [flag for flag, used in (
+            ("-s", args.s != "none"), ("-c", args.c), ("-r", args.r),
+            ("-t", args.t != 50), ("-d", args.d != 7168),
+        ) if used]
+        if ignored:
+            print(f"Note: -Q uses a fixed configuration; ignoring {' '.join(ignored)}")
     dispatch_send_only = 1 if args.s in ("dispatch", "both") else 0
     combine_send_only = 1 if args.s in ("combine", "both") else 0
     cached_mode = args.c
@@ -194,11 +563,11 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     local_experts_start = num_local_experts * my_rank
     local_experts_end = local_experts_start + num_local_experts
 
-    if num_experts % n_ranks != 0:
+    if not quant_mode and num_experts % n_ranks != 0:
         if my_rank == 0:
             print(f"Error: num_experts ({num_experts}) must be divisible by nRanks ({n_ranks})")
         sys.exit(1)
-    if top_k > num_local_experts:
+    if not quant_mode and top_k > num_local_experts:
         if my_rank == 0:
             print(f"Error: top_k ({top_k}) must be <= num_local_experts ({num_local_experts})")
         sys.exit(1)
@@ -216,6 +585,12 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     unique_id = nccl_core.get_unique_id() if my_rank == 0 else None
     unique_id = mpi_comm.bcast(unique_id, root=0)
     comm = nccl_core.Communicator.init(nranks=n_ranks, rank=my_rank, unique_id=unique_id)
+
+    # The quantization mode owns its whole configuration (and its teardown),
+    # so it runs instead of the standard dispatch/combine sequence below.
+    if quant_mode:
+        run_quant_smoke_test(comm, stream, my_rank, n_ranks, algorithm)
+        return
 
     # -- EP group -----------------------------------------------------------
     # max_recv_tokens_per_rank is required for HT (assertion fires on 0);
