@@ -68,6 +68,10 @@ run_case "ll-rm" -a ll -L rm
 run_case "ht-fl" -a ht -L fl
 run_case "ht-em" -a ht -L em
 
+# Quantization smoke coverage for both algorithms.
+run_case "ll-quant" -a ll -Q
+run_case "ht-quant" -a ht -Q
+
 # LL staged execution: dispatch-only, combine-only, and both stages.
 run_case "ll-em-staged-dispatch" -a ll -L em -s dispatch
 run_case "ll-em-staged-combine" -a ll -L em -s combine
