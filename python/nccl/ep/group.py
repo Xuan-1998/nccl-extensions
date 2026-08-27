@@ -12,10 +12,8 @@ from typing import TYPE_CHECKING
 
 from nccl._extensions._binding_helpers import binding_dataclass
 
-from nccl.core.typing import NcclInvalid
-
 from nccl.core.cuda import get_stream_ptr
-from nccl.core.typing import NcclStreamSpec
+from nccl.core.typing import NcclInvalid, NcclStreamSpec
 
 from nccl._extensions.bindings import nccl_ep as _ep_bindings
 from nccl.ep.allocator import AllocConfig
@@ -42,18 +40,27 @@ class GroupConfig:
         algorithm: Dispatch/combine algorithm. Default: ``LOW_LATENCY``.
         num_experts: Total number of experts across all ranks. Required.
         max_dispatch_tokens_per_rank: Maximum tokens any single rank will
-            dispatch. Must be > 0; ``NCCL_EP_AUTO`` is not yet supported
-            even in HT mode.
-        max_token_bytes: Token payload size in bytes (independent of
-            datatype). Required.
-        rdma_buffer_size: RDMA buffer size in bytes. 0 selects a default
-            sized for any algorithm.
+            dispatch. Required for both LL and HT: must be > 0 and
+            identical on every rank.
+        max_token_bytes: Upper bound on per-token row bytes, covering
+            dispatch and combine. Under a quantization recipe the
+            quantized token data *and* its scales must fit in this
+            budget. HT requires a multiple of 16. Required.
+        rdma_buffer_size: LL RDMA staging buffer size in bytes. 0 lets
+            the library size it, possibly lazily at handle creation. An
+            explicit value is allocated exactly and never grown — handle
+            creation fails if the requested layout does not fit.
         num_qp_per_rank: Number of QPs per rank. 0 selects auto.
         num_channels: Channels per rank. 0 selects auto. In HT each
             channel occupies 2 SMs.
-        max_recv_tokens_per_rank: Total recv-slot budget per rank.
-            HT requires > 0 and ``>= max_dispatch_tokens_per_rank``. 
-            LL ignores this field.
+        max_recv_tokens_per_rank: Per-rank recv-slot budget. An explicit
+            HT value must be ``>= max_dispatch_tokens_per_rank``, and
+            expert-major must also account for a token duplicated to
+            several local experts. 0 selects HT eager mode, where the
+            caller sizes dispatch outputs from
+            :py:attr:`LayoutInfo.recv_total_counter`; eager mode supports
+            neither ``OverflowPolicy.DROP`` nor CUDA Graph capture of
+            dispatch. LL ignores this field.
         max_num_sms: Maximum SMs to use for EP kernels (dispatch,
             combine, preprocessing). 0 selects an algorithm-dependent
             default.
@@ -63,18 +70,20 @@ class GroupConfig:
             (LL mode only). When ``True``, a per-rank mask buffer is
             allocated; remote ranks that time out during dispatch or
             combine are skipped rather than tripping a GPU trap, and a
-            host-visible error flag is set (pollable via the mask APIs).
-            Default: ``False``.
+            host-visible error flag is set. The mask and async-error
+            APIs that inspect it (``ncclEpMaskQuery`` and friends) are not
+            wrapped in Python. Default: ``False``.
         timeout_ns: GPU-side wait-loop timeout in nanoseconds. ``0``
             selects the library default (~100 s). Setting too low risks
             false positives. The ``NCCL_EP_TIMEOUT_MS`` env var
             overrides this field at group creation.
-        zero_copy: Bypass library-owned staging buffers. ``AUTO``
-            (default) resolves to ``OFF``. ``ON`` requires window-backed
-            dispatch/combine tensors.
+        zero_copy: Whether library-owned dispatch/combine staging may be
+            bypassed in favor of window-backed tensors; see
+            :py:class:`ZeroCopyMode`. Default ``AUTO``.
         overflow_policy: Policy applied when a rank receives more tokens
             than ``max_recv_tokens_per_rank``. HT only; ignored by LL.
-            Default ``AUTO`` resolves to ``TRAP``.
+            ``DROP`` is unavailable in eager mode. Default ``AUTO``
+            resolves to ``TRAP``.
         num_topk: Upper bound on per-token top-k across all handles of
             this group. Required for HT eager mode with Expert-Major
             layout; 0 means unset.
@@ -163,9 +172,12 @@ class Group:
                 ``RANK_MAJOR``.
             topk_idx: Top-k expert indices for this step
                 (shape ``[num_tokens, top_k]``, int64).
-            layout_info: Optional :class:`LayoutInfo`. HT: set
-                ``expert_counters`` when ``max_dispatch_tokens_per_rank``
-                is ``NCCL_EP_AUTO``. LL mode: must be ``None``.
+            layout_info: Optional :class:`LayoutInfo`. HT: supply
+                ``recv_total_counter`` to learn the actual recv count —
+                required to size dispatch outputs in eager mode
+                (``max_recv_tokens_per_rank=0``); expert-major
+                additionally reports ``expert_counters`` and
+                ``expert_offsets``. LL mode: must be ``None``.
             config: Optional :class:`HandleConfig`; ``None`` forwards
                 NULL (library defaults).
             stream: CUDA stream for the launch.

@@ -13,29 +13,23 @@ wrappers (:class:`Group`, :class:`Handle`, :class:`Tensor`) on top of those bind
 import os as _os
 from pathlib import Path as _Path
 
+from nccl._extensions.bindings import nccl_ep as _ep_bindings
+
+# Defaults for libnccl_ep.so's JIT runtime; either env var can be overridden
+# by setting it in the environment before importing nccl.ep.
+_PKG_DIR = _Path(__file__).parent
+if (_PKG_DIR / "include" / "nccl_ep").is_dir():
+    _os.environ.setdefault("NCCL_EP_HOME", str(_PKG_DIR))
+
+# NCCL public headers (nccl.h, nccl_device/...).
 try:
-    from nccl._extensions.bindings import nccl_ep as _ep_bindings
+    import nvidia.nccl as _nv_nccl
 
-    # Defaults for libnccl_ep.so's JIT runtime; either env var can be overridden
-    # by setting it in the environment before importing nccl.ep.
-    _PKG_DIR = _Path(__file__).parent
-    if (_PKG_DIR / "include" / "nccl_ep").is_dir():
-        _os.environ.setdefault("NCCL_EP_HOME", str(_PKG_DIR))
-
-    # NCCL public headers (nccl.h, nccl_device/...).
-    try:
-        import nvidia.nccl as _nv_nccl
-
-        _NCCL_HOME = _Path(_nv_nccl.__path__[0])
-        if (_NCCL_HOME / "include").is_dir():
-            _os.environ.setdefault("NCCL_HOME", str(_NCCL_HOME))
-    except ImportError:
-        pass
-
-    _ep_bindings_available = True
+    _NCCL_HOME = _Path(_nv_nccl.__path__[0])
+    if (_NCCL_HOME / "include").is_dir():
+        _os.environ.setdefault("NCCL_HOME", str(_NCCL_HOME))
 except ImportError:
-    _ep_bindings = None  # type: ignore[assignment]
-    _ep_bindings_available = False
+    pass
 
 from nccl.ep.allocator import AllocConfig, AllocFn, FreeFn
 from nccl.ep.enums import (
@@ -48,24 +42,19 @@ from nccl.ep.enums import (
     PassDir,
     ZeroCopyMode,
 )
-
-try:
-    from nccl.ep.group import Group, GroupConfig
-    from nccl.ep.handle import (
-        CombineConfig,
-        CombineInputs,
-        CombineOutputs,
-        DispatchConfig,
-        DispatchInputs,
-        DispatchOutputs,
-        Handle,
-        HandleConfig,
-        LayoutInfo,
-    )
-    from nccl.ep.tensor import Tensor
-except ImportError:
-    pass
-
+from nccl.ep.group import Group, GroupConfig
+from nccl.ep.handle import (
+    CombineConfig,
+    CombineInputs,
+    CombineOutputs,
+    DispatchConfig,
+    DispatchInputs,
+    DispatchOutputs,
+    Handle,
+    HandleConfig,
+    LayoutInfo,
+)
+from nccl.ep.tensor import Tensor
 
 __all__ = [
     "Algorithm",
@@ -106,14 +95,10 @@ def _decode_version(v: int) -> _Version:
 
 def get_lib_version() -> _Version:
     """Release version of the loaded ``libnccl_ep.so`` (e.g. ``0.1.0``)."""
-    if not _ep_bindings_available:
-        raise ImportError("nccl._extensions.bindings.nccl_ep is not available (extension not built)")
     return _decode_version(_ep_bindings.get_version())
 
 
 def get_lib_path() -> _Path | None:
     """Path of the loaded ``libnccl_ep.so``, or None if it cannot be determined."""
-    if not _ep_bindings_available:
-        raise ImportError("nccl._extensions.bindings.nccl_ep is not available (extension not built)")
     raw = _ep_bindings.get_library_path()
     return _Path(raw) if raw else None

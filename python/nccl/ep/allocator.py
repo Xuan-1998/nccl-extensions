@@ -60,7 +60,9 @@ handle — the loaded library object then anchors the lifetime instead::
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+
+from nccl._extensions._binding_helpers import binding_dataclass
+from nccl._extensions.bindings import nccl_ep as _ep_bindings
 
 __all__ = ["AllocConfig", "AllocFn", "FreeFn"]
 
@@ -81,19 +83,12 @@ FreeFn = ctypes.CFUNCTYPE(
 """C-callable type: ``cudaError_t (*)(void* ptr, void* context)``."""
 
 
-@dataclass(kw_only=True)
+@binding_dataclass(_ep_bindings.AllocConfig)
 class AllocConfig:
     """Allocator hooks, mirroring :c:struct:`ncclEpAllocConfig_t`.
 
     Leaving every field at 0 selects NCCL EP's default
     ``cudaMalloc``/``cudaFree`` path.
-
-    Note:
-        This is a plain dataclass for now — it is not yet wired up to the
-        native ``ncclEpAllocConfig_t`` struct, since the Cython extension
-        that would do so hasn't been ported yet (tracked in a follow-up
-        issue). Once that lands, this will materialize the native struct
-        the same way ``nccl4py``'s ``binding_dataclass`` helper does.
 
     Attributes:
         alloc_fn: Address of a custom ``ncclEpAllocFn_t``-compatible C

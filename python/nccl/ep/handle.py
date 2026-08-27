@@ -13,6 +13,7 @@ entry points: :class:`HandleConfig`, :class:`DispatchConfig`,
 
 from __future__ import annotations
 
+from dataclasses import field
 from typing import TYPE_CHECKING
 
 from nccl.core.cuda import get_stream_ptr
@@ -21,7 +22,12 @@ from nccl.core.typing import NcclInvalid, NcclStreamSpec
 
 from nccl._extensions._binding_helpers import binding_dataclass
 from nccl._extensions.bindings import nccl_ep as _ep_bindings
-from nccl.ep.enums import DispatchQuantizationRecipe, ExpertIdKind, PassDir
+from nccl.ep.enums import (
+    CombineQuantizationRecipe,
+    DispatchQuantizationRecipe,
+    ExpertIdKind,
+    PassDir,
+)
 
 if TYPE_CHECKING:
     from nccl.ep.tensor import Tensor
@@ -77,14 +83,19 @@ class DispatchConfig:
         pass_direction: Forward (default) or backward pass; HT-only.
             ``FWD`` requires ``inputs.topk_weights``; ``BWD`` forbids it
             and also forbids ``outputs.topk_weights`` / ``outputs.topk_idx``.
-        quantization_recipe: Selects the quantized dispatch pipeline.
-            Default ``NONE`` uses unquantized transport.
+        quantization_recipe: Selects the quantized dispatch pipeline and
+            the scale tensors it requires; see
+            :py:class:`DispatchQuantizationRecipe`. Default ``NONE``.
     """
 
     send_only: int = 0
     round_scales: int = 0
     pass_direction: PassDir = PassDir.FWD
-    quantization_recipe: DispatchQuantizationRecipe = DispatchQuantizationRecipe.NONE
+    # Spelled out here for readability; the C field is `quant_recipe`.
+    quantization_recipe: DispatchQuantizationRecipe = field(
+        default=DispatchQuantizationRecipe.NONE,
+        metadata={"lowpp": "quant_recipe"},
+    )
 
 
 @binding_dataclass(_ep_bindings.CombineConfig)
@@ -99,10 +110,19 @@ class CombineConfig:
         pass_direction: Forward (default) or backward pass; HT-only.
             ``FWD`` forbids ``inputs.topk_weights``; ``BWD`` requires
             both ``inputs.topk_weights`` and ``outputs.topk_weights``.
+        quantization_recipe: Selects the quantized combine pipeline; see
+            :py:class:`CombineQuantizationRecipe`. Default ``NONE``.
+            ``NVFP4`` is LL-only, experimental, and requires
+            :py:attr:`CombineInputs.scales`.
     """
 
     send_only: int = 0
     pass_direction: PassDir = PassDir.FWD
+    # Spelled out here for readability; the C field is `quant_recipe`.
+    quantization_recipe: CombineQuantizationRecipe = field(
+        default=CombineQuantizationRecipe.NONE,
+        metadata={"lowpp": "quant_recipe"},
+    )
 
 
 @binding_dataclass(_ep_bindings.LayoutInfo)
@@ -117,17 +137,24 @@ class LayoutInfo:
         expert_counters: 1D ``[num_local_experts]`` int32 (or int64 in
             HT expert-major).
 
-            * HT (handle time): per-expert received counts.
+            * HT (handle time): per-expert received counts — unpadded
+              under flat, padded under expert-major (their sum is then
+              the output slot count).
             * LL expert-major (dispatch time): per-expert received
               token counts written by NCCL EP.
         src_rank_counters: 1D ``[num_ranks]`` int32. LL rank-major only
             (dispatch time): per-source-rank token counts.
         expert_offsets: 1D ``[num_local_experts]`` int32 or int64. HT
             expert-major only: prefix sum of padded per-expert counts.
-        recv_total_counter: 1D ``[1]`` int32 or int64. HT scalar total
-            received-token count.
-        recv_topk_idx_kind: Numbering of values written to recv_topk_idx.
-            ``AUTO`` (default) resolves to ``LOCAL``.
+        recv_total_counter: 1D ``[1]`` int32 or int64. HT (handle time)
+            scalar total received-token count — unpadded under flat, the
+            padded slot total under expert-major. Copy it device-to-host
+            and synchronize to size dispatch outputs in eager mode.
+        recv_topk_idx_kind: Numbering of the values written to
+            ``recv_topk_idx``; see :py:class:`ExpertIdKind`. ``AUTO``
+            (default) resolves to ``LOCAL`` today, but that is not a
+            stable contract. Ignored by the expert-major layouts, which
+            do not populate ``recv_topk_idx``.
     """
 
     expert_counters: Tensor | None = None
@@ -148,7 +175,12 @@ class DispatchInputs:
         tokens: 2D ``[num_tokens, hidden]``. Token payload.
         topk_weights: 2D ``[num_tokens, top_k]`` float32. LL rank-major
             per-token routing weights, or HT forward routing weights.
-        scales: 2D ``[num_tokens, hidden/128]`` float32. HT FP8 only.
+        scales: 2D ``[num_tokens, scale_elems_per_token]`` per-token
+            scaling factors. Required by
+            :py:attr:`DispatchQuantizationRecipe.FWD`, which forwards the
+            bytes unconverted; must be absent for
+            :py:attr:`~DispatchQuantizationRecipe.NONE` and
+            :py:attr:`~DispatchQuantizationRecipe.DS_FP8E3M4`.
     """
 
     tokens: Tensor | None = None
@@ -169,7 +201,12 @@ class DispatchOutputs:
     Attributes:
         tokens: Received tokens.
         topk_weights: LL rank-major or HT: received top-k weights.
-        scales: FP8 only: received per-token scaling factors.
+        scales: Received per-token scaling factors. Required by
+            :py:attr:`DispatchQuantizationRecipe.FWD` (forwarded
+            unchanged from the input) and by
+            :py:attr:`~DispatchQuantizationRecipe.DS_FP8E3M4` (FP32, one
+            per 128 token elements); must be absent for
+            :py:attr:`~DispatchQuantizationRecipe.NONE`.
         topk_idx: LL rank-major or HT: received top-k expert indices.
     """
 
@@ -191,10 +228,15 @@ class CombineInputs:
             algorithm/layout — see ``nccl_ep.h``).
         topk_weights: 2D ``[num_recv_tokens, top_k]`` float32. HT
             backward combine only.
+        scales: Experimental NVFP4 combine only: FP32 per-expert-token
+            global quantization scales. For each valid token row, pass
+            ``2688 / amax(abs(tokens[row, :]))``, or 0 when ``amax`` is
+            0.
     """
 
     tokens: Tensor | None = None
     topk_weights: Tensor | None = None
+    scales: Tensor | None = None
 
 
 @binding_dataclass(_ep_bindings.CombineOutputs)
@@ -251,9 +293,12 @@ class Handle:
         Args:
             topk_idx: New top-k indices tensor for the upcoming dispatch.
             stream: CUDA stream for the launch.
-            layout_info: Optional :class:`LayoutInfo`. HT: set
-                ``expert_counters`` when ``max_dispatch_tokens_per_rank`` is
-                ``NCCL_EP_AUTO``. LL mode: must be ``None``.
+            layout_info: Optional :class:`LayoutInfo`. HT: supply
+                ``recv_total_counter`` to learn the actual recv count —
+                required to size dispatch outputs in eager mode
+                (``max_recv_tokens_per_rank=0``); expert-major
+                additionally reports ``expert_counters`` and
+                ``expert_offsets``. LL mode: must be ``None``.
 
         See Also:
             :meth:`dispatch`.
