@@ -26,7 +26,12 @@
  *     dispatch(A, send_only), complete(A), combine(A)
  *     dispatch(B, send_only), complete(B), combine(B)
  *
- * This verifies that a send-only operation stages one group epoch and its
+ * and a split combine for each handle:
+ *
+ *     dispatch(A), combine(A, send_only), complete(A)
+ *     dispatch(B), combine(B, send_only), complete(B)
+ *
+ * These verify that a send-only operation stages one group epoch and its
  * matching completion consumes it.  The LL RDMA buffers are group resources,
  * so a group-owned epoch must advance once for every operation, independent of
  * which handle issued it.  Each ordering is repeated and validates both
@@ -267,7 +272,7 @@ public:
 
 }  // namespace
 
-TEST(LlGroupEpochTest, TwoHandlesFullAndSplitDispatchLifecycles) {
+TEST(LlGroupEpochTest, TwoHandlesFullAndStagedLifecycles) {
     LayerArrayGuard layer_guard;
     auto& layers = layer_guard.layers;
     const size_t input_elems = static_cast<size_t>(kNumTokens) * kLlHidden;
@@ -329,14 +334,16 @@ TEST(LlGroupEpochTest, TwoHandlesFullAndSplitDispatchLifecycles) {
         ASSERT_NE(layer.handle, nullptr);
     }
 
-    for (int ordering_idx = 0; ordering_idx < 3; ++ordering_idx) {
+    for (int ordering_idx = 0; ordering_idx < 4; ++ordering_idx) {
         const bool phase_batched = ordering_idx == 1;
         const bool split_dispatch = ordering_idx == 2;
+        const bool split_combine = ordering_idx == 3;
         for (int iteration = 0; iteration < kIterations; ++iteration) {
             SCOPED_TRACE(::testing::Message() << "ordering="
                          << (phase_batched ? "D(A),D(B),C(A),C(B)"
                                            : split_dispatch ? "D_send(A),Complete(A),C(A),D_send(B),Complete(B),C(B)"
-                                                            : "D(A),C(A),D(B),C(B)"));
+                                           : split_combine ? "D(A),C_send(A),Complete(A),D(B),C_send(B),Complete(B)"
+                                                           : "D(A),C(A),D(B),C(B)"));
             std::array<std::vector<nv_bfloat16>, 2> host_inputs;
             for (int layer_idx = 0; layer_idx < static_cast<int>(layers.size()); ++layer_idx) {
                 LayerState& layer = layers[layer_idx];
@@ -367,10 +374,11 @@ TEST(LlGroupEpochTest, TwoHandlesFullAndSplitDispatchLifecycles) {
                 return ncclEpDispatch(layer.handle, &inputs, &outputs, &layout_info, &config, g_stream);
             };
 
-            auto combine = [](LayerState& layer) {
+            auto combine = [](LayerState& layer, bool send_only = false) {
                 ncclEpCombineInputs_t inputs = NCCL_EP_COMBINE_INPUTS_INIT;
                 ncclEpCombineOutputs_t outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
                 ncclEpCombineConfig_t config = NCCL_EP_COMBINE_CONFIG_INIT;
+                config.send_only = send_only;
                 inputs.tokens = layer.dispatched;
                 outputs.tokens = layer.combined;
                 outputs.topk_weights = layer.weights;
@@ -393,6 +401,13 @@ TEST(LlGroupEpochTest, TwoHandlesFullAndSplitDispatchLifecycles) {
                 NCCL_ASSERT(dispatch(layers[1], true));
                 NCCL_ASSERT(complete(layers[1]));
                 NCCL_ASSERT(combine(layers[1]));
+            } else if (split_combine) {
+                NCCL_ASSERT(dispatch(layers[0]));
+                NCCL_ASSERT(combine(layers[0], true));
+                NCCL_ASSERT(complete(layers[0]));
+                NCCL_ASSERT(dispatch(layers[1]));
+                NCCL_ASSERT(combine(layers[1], true));
+                NCCL_ASSERT(complete(layers[1]));
             } else {
                 NCCL_ASSERT(dispatch(layers[0]));
                 NCCL_ASSERT(combine(layers[0]));

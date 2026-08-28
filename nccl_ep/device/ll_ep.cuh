@@ -2245,7 +2245,7 @@ LOW_LATENCY_COMBINE_RECV:
                 timeoutCycles);
         }
     }
-    if (phases & LOW_LATENCY_SEND_PHASE) cg::this_grid().sync();
+    cg::this_grid().sync();
     completeFullLowLatencyEpoch(epochState, phases, smId, threadId);
 
     // Reassign warp groups; FP32 doubles SMEM per group, drop to 1 group to stay within limits
