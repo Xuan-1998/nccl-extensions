@@ -726,8 +726,10 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
     if not is_ll:
         handle_recv_total = make_tensor(1, nccl_core.INT32, 1)
         if is_em:
-            handle_expert_counters = make_tensor(1, nccl_core.INT64, num_local_experts)
-            handle_expert_offsets = make_tensor(1, nccl_core.INT64, num_local_experts)
+            # HT preprocessing requires every integer output tensor in one
+            # LayoutInfo to use the same dtype.
+            handle_expert_counters = make_tensor(1, nccl_core.INT32, num_local_experts)
+            handle_expert_offsets = make_tensor(1, nccl_core.INT32, num_local_experts)
         handle_layout_info = nccl_ep.LayoutInfo(
             expert_counters=handle_expert_counters.tensor if handle_expert_counters else None,
             expert_offsets=handle_expert_offsets.tensor if handle_expert_offsets else None,
@@ -762,14 +764,14 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         num_recv_tokens = max_recv_slots
     assert num_recv_tokens > 0
     if not is_ll and is_em:
-        counts_host = np.empty(num_local_experts, dtype=np.int64)
-        offsets_host = np.empty(num_local_experts, dtype=np.int64)
+        counts_host = np.empty(num_local_experts, dtype=np.int32)
+        offsets_host = np.empty(num_local_experts, dtype=np.int32)
         d2h(counts_host, handle_expert_counters.data, stream)
         d2h(offsets_host, handle_expert_offsets.data, stream)
         stream.sync()
         expected_offsets = np.concatenate((
-            np.array([0], dtype=np.int64),
-            np.cumsum(counts_host[:-1], dtype=np.int64),
+            np.array([0], dtype=np.int32),
+            np.cumsum(counts_host[:-1], dtype=np.int32),
         ))
         if not np.array_equal(offsets_host, expected_offsets):
             raise AssertionError(
@@ -859,7 +861,10 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
             topk_weights=output_topk_weights.tensor,
             topk_idx=output_topk_idx.tensor if output_topk_idx else None,
         )
-        dispatch_layout = None
+        dispatch_layout = (
+            nccl_ep.LayoutInfo(recv_topk_idx_kind=expert_kind_map[args.expert_id_kind])
+            if not is_em else None
+        )
 
     print(f"Rank {my_rank}: Testing dispatch (send_only={bool(dispatch_send_only)})")
     ep_handle.dispatch(
@@ -1099,9 +1104,12 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         co_host = np.empty(num_tokens * hidden, dtype=np.uint16)
         d2h(co_host, combined_output.data, stream)
         stream.sync()
+        # HT expert-major combine sums one received slot per top-k route.
+        # Other layouts either reduce locally or apply routing weights.
+        combine_scale = top_k if not is_ll and is_em else 1
         for i in range(num_tokens):
             for j in range(ELEMENTS_TESTED_PER_TOKEN):
-                expected = float_to_bf16(float((j + 1) * 2))
+                expected = float_to_bf16(float(combine_scale * (j + 1) * 2))
                 actual = int(co_host[i * hidden + j])
                 if actual != expected:
                     print(f"Combine check failed! Rank {my_rank}, token {i}, "
@@ -1323,7 +1331,10 @@ def main():  # noqa: C901 — kept as a single function to mirror ep_test.cu
         d2h(updated_combined, combined_output.data, stream)
         stream.sync()
         expected_prefix = np.array(
-            [float_to_bf16(float((j + 1) * 2)) for j in range(ELEMENTS_TESTED_PER_TOKEN)],
+            [
+                float_to_bf16(float(combine_scale * (j + 1) * 2))
+                for j in range(ELEMENTS_TESTED_PER_TOKEN)
+            ],
             dtype=np.uint16,
         )
         if not np.array_equal(updated_combined[:ELEMENTS_TESTED_PER_TOKEN], expected_prefix):

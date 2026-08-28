@@ -5,7 +5,7 @@ set -uo pipefail
 
 : "${NP:=8}"
 : "${NCCL_EP_PYTHON_TEST_TOKENS:=16}"
-: "${NCCL_EP_PYTHON_TEST_HIDDEN:=128}"
+: "${NCCL_EP_PYTHON_TEST_HIDDEN:=1024}"
 : "${NCCL_EP_PYTHON_TEST_TIMEOUT:=300}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
