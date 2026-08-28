@@ -17,11 +17,27 @@ implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initi
 # Table of Contents
 
 - [Overview](#overview)
+  - [Key Features](#key-features)
+  - [Quick Start](#quick-start)
 - [Usage](#usage)
+  - [Prerequisites](#prerequisites)
+  - [Building](#building)
+  - [Running](#running)
 - [Core Concepts](#core-concepts)
-- [API Reference](#api-reference)
+  - [Key Data Structures](#key-data-structures)
+  - [Algorithm-related configurations](#algorithm-related-configurations)
+  - [HT-specific modifiers](#ht-specific-modifiers)
+  - [LL-specific modifiers](#ll-specific-modifiers)
+  - [Zero-copy](#zero-copy)
+  - [Custom Allocators](#custom-allocators)
+  - [Elastic (GPU + CPU) receive buffers](#elastic-gpu--cpu-receive-buffers)
+  - [API Reference](#api-reference)
 - [Execution Modes](#execution-modes)
+  - [Synchronous Mode (Default)](#synchronous-mode-default)
+  - [Staged Mode (Low Latency Only)](#staged-mode-low-latency-only)
 - [Usage Examples](#usage-examples)
+  - [Example 1: High Throughput Mode - Forward and Backward Pass](#example-1-high-throughput-mode---forward-and-backward-pass)
+  - [Example 2: Low Latency Mode - Forward Pass (Expert-Major and Rank-Major)](#example-2-low-latency-mode---forward-pass-expert-major-and-rank-major)
 
 **Guides**
 
@@ -437,7 +453,8 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 
 ## Algorithm-related configurations
 
-**High Throughput (HT)**:
+### High Throughput (HT)
+
 - Supports `NCCL_EP_LAYOUT_FLAT` and `NCCL_EP_LAYOUT_EXPERT_MAJOR` layouts.
 
 - **`NCCL_EP_LAYOUT_FLAT`**: dispatch output is a contiguous 2D sequence `[N(r) x hidden]` where `N(r)` is the total number of tokens targeting this rank.
@@ -450,45 +467,8 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
   - Tokens arrive pre-sorted by expert; the caller feeds each expert's slice directly without needing `topk_idx` for routing.
   - Set `ncclEpLayoutInfo_t.expert_counters` (1D tensor, length = `num_local_experts`) to receive per-expert received token counts.
 
-***Zero-copy***
+### Low Latency (LL)
 
-Dispatch and combine normally move payloads through library-owned staging
-buffers. A caller can enable direct peer access to input/output buffers by
-attaching a NCCL window (`ncclCommWindowRegister`) to the respective tensor.
-Refer to the [Zero-Copy](docs/documentation/zero_copy.md) documentation for more
-details.
-
-***Eager mode (HT only)***
-
-A group normally commits to a fixed per-rank recv budget, and every dispatch recv
-tensor is sized to it. Creating the group with
-`max_recv_tokens_per_rank = NCCL_EP_AUTO` selects *eager mode* instead, where the
-caller sizes those tensors per iteration to the actual recv count of the current
-routing, read from `ncclEpLayoutInfo_t.recv_total_counter`.
-Refer to the [Eager Mode](docs/documentation/eager_mode.md) documentation for more
-details.
-
-***Recv overflow policy (HT only)***
-
-Routing is data-dependent, so a rank can be targeted by more tokens than the
-`max_recv_tokens_per_rank` budget it was created with.
-`ncclEpGroupConfig_t::overflow_policy` selects what happens then; LL ignores it.
-
-- **`NCCL_EP_OVERFLOW_TRAP`** — the zero-init default (`NCCL_EP_OVERFLOW_AUTO`
-  resolves to it). Overflow executes a device `__trap()`, which **aborts the
-  process**; it is not a recoverable `ncclResult_t`.
-- **`NCCL_EP_OVERFLOW_DROP`** — overflowing tokens are discarded and the pipeline
-  continues. `recv_total_counter` reports the true pre-drop total, so comparing it
-  against `max_recv_tokens_per_rank` tells the caller a drop occurred. Requires an
-  explicit `max_recv_tokens_per_rank` and does not let you under-size the recv
-  tensors.
-
-Overflow is detected during `ncclEpCreateHandle` / `ncclEpUpdateHandle`, not at
-dispatch. See the [Recv Overflow Policy guide](docs/documentation/overflow_policy.md) for the two
-stages at which tokens can be dropped, the exact reported counts, and why
-`expert_counters` is an upper bound under `DROP`.
-
-**Low Latency (LL)**:
 - Supports `NCCL_EP_LAYOUT_EXPERT_MAJOR` and `NCCL_EP_LAYOUT_RANK_MAJOR` layouts.
 - Accepts `ncclInt32` or `ncclInt64` routing indices and supports up to 32 top-k
   entries.
@@ -503,7 +483,31 @@ stages at which tokens can be dropped, the exact reported counts, and why
   [Zero-Copy](docs/documentation/zero_copy.md).
 - Does not support dynamic `max_dispatch_tokens_per_rank` detection.
 
-***`rdma_buffer_size` and lazy allocation (LL only)***
+## HT-specific modifiers
+
+### Eager mode
+
+A group normally commits to a fixed per-rank recv budget, and every dispatch recv
+tensor is sized to it. Creating the group with
+`max_recv_tokens_per_rank = NCCL_EP_AUTO` selects *eager mode* instead, where the
+caller sizes those tensors per iteration to the actual recv count of the current
+routing, read from `ncclEpLayoutInfo_t.recv_total_counter`.
+Refer to the [Eager Mode](docs/documentation/eager_mode.md) documentation for more
+details.
+
+### Recv overflow policy
+
+Routing is data-dependent, so a rank can be targeted by more tokens than the
+`max_recv_tokens_per_rank` budget its group was created with.
+`ncclEpGroupConfig_t::overflow_policy` selects what happens then: by default the
+device traps and the process aborts, while `NCCL_EP_OVERFLOW_DROP` discards the
+excess tokens and lets the pipeline continue. LL ignores the field.
+Refer to the [Recv Overflow Policy](docs/documentation/overflow_policy.md)
+documentation for more details.
+
+## LL-specific modifiers
+
+### `rdma_buffer_size` and lazy allocation (LL only)
 
 The group's RDMA buffer is sized by `config.rdma_buffer_size`:
 
@@ -520,6 +524,14 @@ The recorded layout offsets on every live handle are pure offsets relative to th
   3. **CUDA graph capture bakes the RDMA base pointer into the captured kernel parameters.** `ncclEpInitHandle` (in AUTO mode) must not be called between `cudaStreamBeginCapture` and `cudaStreamEndCapture`. Any previously captured graph containing EP kernels must be destroyed and re-captured after a reallocation.
 
 - **Explicit `> 0`**: the buffer is allocated to exactly that size at `ncclEpCreateGroup` time. `ncclEpInitHandle` is purely local; it returns `ncclInvalidUsage` if the requested `(layout, num_topk)` does not fit. Use this mode if you need to avoid collective handle creation, mid-stream reallocation, or graph invalidation. Use `nccl_ep::get_low_latency_rdma_size_hint(...)` to compute a worst-case upper bound across all layouts and `num_topk ≤ MAX_NUM_TOPK`.
+
+## Zero-copy
+
+Dispatch and combine normally move payloads through library-owned staging
+buffers. A caller can enable direct peer access to input/output buffers by
+attaching a NCCL window (`ncclCommWindowRegister`) to the respective tensor.
+Refer to the [Zero-Copy](docs/documentation/zero_copy.md) documentation for more
+details.
 
 ## Custom Allocators
 
