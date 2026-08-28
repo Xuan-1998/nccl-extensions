@@ -79,79 +79,21 @@ ncclResult_t ncclEpGroupDestroy(
 );
 ```
 
-## Tensor Descriptors
-
-`ncclEpTensor_t` is a plain value struct.  The common path is to allocate on the
-stack (or as a struct member), zero-initialise with `NCCL_EP_TENSOR_INIT`, and
-fill fields directly:
-
-```c
-size_t dims[2] = { N, H };
-ncclEpTensor_t t = NCCL_EP_TENSOR_INIT;
-t.ndim = 2; t.datatype = ncclFloat16; t.data = data_ptr;
-t.sizes = dims;   // caller owns; must outlive the descriptor's use
-```
-
-For window-backed tensors set `win_hdl` / `win_offset` instead of `data`.
-
-When a heap-allocated descriptor with a library-owned `sizes` copy is more
-convenient, use `ncclEpTensorAlloc` to obtain one and `ncclEpTensorDestroy`
-to release it (the backing data buffer remains caller-owned).
-
-All user-facing tensor fields (`data`, `ndim`, `datatype`, `sizes`, `win_hdl`,
-`win_offset`) are directly accessible as struct members.  Public structs
-(`ncclEpDispatchInputs_t`, `ncclEpLayoutInfo_t`, …) hold `ncclEpTensor_t*`
-pointers, so callers can mix stack-, static-, and heap-allocated descriptors.
-
-### `ncclEpTensorAlloc()`
-
-```c
-// Allocate a tensor descriptor sufficient to represent the requested shape.
-// The library copies `sizes` into its own storage, so the caller's array need
-// not outlive the call. The backing data buffer remains caller-owned.
-//
-// Arguments:
-//   tensor   - [OUT] On success, receives a pointer to the new descriptor.
-//   ndim     - [IN]  Number of dimensions (> 0).
-//   datatype - [IN]  Element type.
-//   sizes    - [IN]  Array of `ndim` dimension sizes.
-//   config   - [IN]  Optional allocation configuration. NULL = defaults.
-//
-// Returns: ncclResult_t error code
-
-ncclResult_t ncclEpTensorAlloc(
-    ncclEpTensor_t** tensor,
-    unsigned int ndim,
-    ncclDataType_t datatype,
-    const size_t* sizes,
-    const ncclEpTensorAllocConfig_t* config);
-```
-
-### `ncclEpTensorDestroy()`
-
-```c
-// Release a descriptor previously returned by ncclEpTensorAlloc.
-// Does not free the descriptor's data buffer, which is caller-owned.
-//
-// Arguments:
-//   tensor - [IN] Pointer returned by ncclEpTensorAlloc. NULL is accepted.
-//
-// Returns: ncclResult_t error code
-
-ncclResult_t ncclEpTensorDestroy(ncclEpTensor_t* tensor);
-```
-
 ## Handle Management
+
+### Handle usage limitations
+
+Currently,  HT mode supports 1F1B mode allowing multiple handles to be active on the same EP group. LL mode currently is limited to a single Handle per Group due to a known issue (see [NCCL EP v0.2 Release Notes](../release/RELEASE_NOTES_v0.2.md#ll-one-handle-per-group))
 
 ### `ncclEpCreateHandle()`
 
 ```c
 // Create and initialize an EP handle.
-//   Performs dispatch setup and (in HT mode only) metadata exchange.
-//   This call is collective and must be invoked by all ranks in the group.
-//   The routing carried by `topk_idx` is cached on the handle; subsequent
-//   ncclEpDispatch / ncclEpCombine calls reuse it until ncclEpUpdateHandle
-//   replaces it with new routing.
+// Performs dispatch setup and (in HT mode only) metadata exchange.
+// This call is collective and must be invoked by all ranks in the group.
+// The routing carried by `topk_idx` is cached on the handle; subsequent
+// ncclEpDispatch / ncclEpCombine calls reuse it until ncclEpUpdateHandle
+// replaces it with new routing.
 //
 // Arguments:
 //   handle              - [OUT] Pointer to newly created and initialized EP handle
@@ -293,6 +235,70 @@ ncclResult_t ncclEpHandleMemSize(
     int num_topk);
 ```
 
+## Tensor Descriptors
+
+`ncclEpTensor_t` is a plain value struct.  The common path is to allocate on the
+stack (or as a struct member), zero-initialise it with `NCCL_EP_TENSOR_INIT`, and
+fill fields directly:
+
+```c
+int N = 128;
+int H = 2048;
+size_t dims[2] = { N, H };
+ncclEpTensor_t t = NCCL_EP_TENSOR_INIT;
+t.ndim = 2; t.datatype = ncclFloat16; t.data = data_ptr;
+t.sizes = dims;   // caller owns; must outlive the descriptor's use
+```
+
+For window-backed tensors set `win_hdl` / `win_offset` instead of `data`.
+
+When a heap-allocated descriptor with a library-owned `sizes` copy is more
+convenient, use `ncclEpTensorAlloc` to obtain one and `ncclEpTensorDestroy`
+to release it (the backing data buffer remains caller-owned).
+
+All user-facing tensor fields (`data`, `ndim`, `datatype`, `sizes`, `win_hdl`,
+`win_offset`) are directly accessible as struct members.  Public structs
+(`ncclEpDispatchInputs_t`, `ncclEpLayoutInfo_t`, …) hold `ncclEpTensor_t*`
+pointers, so callers can mix stack-, static-, and heap-allocated descriptors.
+
+### `ncclEpTensorAlloc()`
+
+```c
+// Allocate a tensor descriptor sufficient to represent the requested shape.
+// The library copies `sizes` into its own storage, so the caller's array need
+// not outlive the call. The backing data buffer remains caller-owned.
+//
+// Arguments:
+//   tensor   - [OUT] On success, receives a pointer to the new descriptor.
+//   ndim     - [IN]  Number of dimensions (> 0).
+//   datatype - [IN]  Element type.
+//   sizes    - [IN]  Array of `ndim` dimension sizes.
+//   config   - [IN]  Optional allocation configuration. NULL = defaults.
+//
+// Returns: ncclResult_t error code
+
+ncclResult_t ncclEpTensorAlloc(
+    ncclEpTensor_t** tensor,
+    unsigned int ndim,
+    ncclDataType_t datatype,
+    const size_t* sizes,
+    const ncclEpTensorAllocConfig_t* config);
+```
+
+### `ncclEpTensorDestroy()`
+
+```c
+// Release a descriptor previously returned by ncclEpTensorAlloc.
+// Does not free the descriptor's data buffer, which is caller-owned.
+//
+// Arguments:
+//   tensor - [IN] Pointer returned by ncclEpTensorAlloc. NULL is accepted.
+//
+// Returns: ncclResult_t error code
+
+ncclResult_t ncclEpTensorDestroy(ncclEpTensor_t* tensor);
+```
+
 ## Communication Operations
 
 ### `ncclEpDispatch()`
@@ -385,6 +391,9 @@ ncclResult_t ncclEpCombine(
 ```
 
 ### `ncclEpComplete()` (LL mode only)
+
+Must be the first NCCL EP operation to be executed after dispatch or combine,
+no other op is allowed on handle or group in between.
 
 ```c
 // Continues a staged EP operation to completion.
