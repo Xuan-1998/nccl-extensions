@@ -460,24 +460,13 @@ details.
 
 ***Eager mode (HT only)***
 
-Creating the group with `max_recv_tokens_per_rank = NCCL_EP_AUTO` selects *eager
-mode*: instead of sizing every dispatch recv tensor to a fixed worst-case budget,
-the caller sizes them to the actual recv count of the current routing, read from
-`ncclEpLayoutInfo_t.recv_total_counter`.
-
-The worst case does not disappear — the library still derives
-`nRanks × max_dispatch_tokens_per_rank × max(num_topk, 1)` to size its **internal**
-buffers. A GPU OOM at `ncclEpCreateGroup` under `NCCL_EP_AUTO` usually means that
-derived budget is too large; set `max_recv_tokens_per_rank` explicitly to a
-measured peak instead.
-
-Eager mode requires `ncclEpGroupConfig_t::num_topk` with the expert-major layout.
-
-It is not compatible with CUDA Graph capture of `ncclEpDispatch` and
-drop-on-overflow policy (see `NCCL_EP_OVERFLOW_DROP`).
-
-See the [Eager Mode guide](docs/documentation/eager_mode.md) for the sizing
-protocol, per-layout differences, and a comparison against a fixed budget.
+A group normally commits to a fixed per-rank recv budget, and every dispatch recv
+tensor is sized to it. Creating the group with
+`max_recv_tokens_per_rank = NCCL_EP_AUTO` selects *eager mode* instead, where the
+caller sizes those tensors per iteration to the actual recv count of the current
+routing, read from `ncclEpLayoutInfo_t.recv_total_counter`.
+Refer to the [Eager Mode](docs/documentation/eager_mode.md) documentation for more
+details.
 
 ***Recv overflow policy (HT only)***
 
