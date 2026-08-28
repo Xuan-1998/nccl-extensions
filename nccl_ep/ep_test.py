@@ -299,7 +299,7 @@ def run_quant_smoke_test(comm, stream, my_rank: int, n_ranks: int, algorithm) ->
     # quantized fp8 + scales payload simply fits inside it.
     max_token_bytes = QUANT_HIDDEN * 2
     assert max_token_bytes >= token_bytes + scale_bytes, "budget must cover tokens + scales"
-    # Each physical row, and the HT budget, must be 16-byte aligned (quantization.md).
+    # Each physical row, and the HT budget, must be 16-byte aligned (docs/documentation/quantization.md).
     assert token_bytes % 16 == 0, "token row must be 16-byte aligned"
     assert scale_bytes % 16 == 0, "scale row must be 16-byte aligned"
     assert max_token_bytes % 16 == 0, "max_token_bytes must be 16-byte aligned for HT"

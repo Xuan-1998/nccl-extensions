@@ -25,12 +25,12 @@ implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initi
 
 **Guides**
 
-- [API Reference](api_reference.md) — every public entry point
-- [JIT Kernel Compilation](jit.md) — runtime `nvcc` knobs, paths, and cache
-- [Quantization](quantization.md) — dispatch and combine recipes
-- [Zero-Copy Staging](zero_copy.md) — window-backed direct paths
-- [Recv Overflow Policy](overflow_policy.md) — HT trap / drop behavior
-- [HT Eager Mode](eager_mode.md) — per-routing recv sizing
+- [API Reference](docs/documentation/api_reference.md) — every public entry point
+- [JIT Kernel Compilation](docs/documentation/jit.md) — runtime `nvcc` knobs, paths, and cache
+- [Quantization](docs/documentation/quantization.md) — dispatch and combine recipes
+- [Zero-Copy Staging](docs/documentation/zero_copy.md) — window-backed direct paths
+- [Recv Overflow Policy](docs/documentation/overflow_policy.md) — HT trap / drop behavior
+- [HT Eager Mode](docs/documentation/eager_mode.md) — per-routing recv sizing
 
 # Overview
 
@@ -123,7 +123,7 @@ names the struct and the **Field** column names the field within it.
 * N(r) = number of tokens targeting rank r
 
 For quantization recipes, tensor contracts, and `max_token_bytes` sizing, see
-[Quantization](quantization.md).
+[Quantization](docs/documentation/quantization.md).
 
 
 #### LL mode (same data type)
@@ -279,7 +279,7 @@ export NCCL_DEBUG=INFO        # Enable NCCL debug output
 export NCCL_DEBUG_SUBSYS=ALL  # All subsystems
 export NCCL_EP_DEBUG=1        # NCCL-EP diagnostics, including zero-copy selection and fallback reasons
 export NCCL_EP_ENV_VERBOSE=true  # Resolved NCCL-EP environment at group creation
-export NCCL_EP_JIT_LOG=1      # Runtime kernel-compilation diagnostics (see jit.md)
+export NCCL_EP_JIT_LOG=1      # Runtime kernel-compilation diagnostics (see docs/documentation/jit.md)
 ```
 
 > **Runtime kernel compilation.** NCCL EP compiles some device kernels on first
@@ -287,7 +287,7 @@ export NCCL_EP_JIT_LOG=1      # Runtime kernel-compilation diagnostics (see jit.
 > a writable cache directory (default `/tmp/nccl_ep/jit`). A build that stays
 > where it was built needs no configuration; relocated installs, wheels,
 > containers, and read-only filesystems do. See
-> [JIT Kernel Compilation](jit.md) for every knob, including `NCCL_EP_HOME`.
+> [JIT Kernel Compilation](docs/documentation/jit.md) for every knob, including `NCCL_EP_HOME`.
 
 ### High-Throughput tuning
 
@@ -391,7 +391,7 @@ typedef struct {
                                                 //   HT: required (must be >= max_dispatch_tokens_per_rank)
                                                 //   LL: unused (buffers always sized automatically); pass NCCL_EP_AUTO
     unsigned int max_token_bytes;               // Max token-row bytes. For quantized transmission, quantized
-                                                //   token data and scales must fit within this budget; see quantization.md.
+                                                //   token data and scales must fit within this budget; see docs/documentation/quantization.md.
     unsigned long int rdma_buffer_size;         // RDMA buffer size for LL mode.
                                                 //   NCCL_EP_AUTO  → lazy: allocate on first ncclEpInitHandle, sized to that
                                                 //                  handle's actual (layout, num_topk); collective re-grow
@@ -406,13 +406,13 @@ typedef struct {
     unsigned int enable_mask;                   // Enable active-mask fault tolerance (LL only)
     uint64_t timeout_ns;                        // GPU-side wait-loop timeout (0 = default)
     ncclEpZeroCopyMode_t zero_copy;             // Window-backed staging control (AUTO / OFF / ON);
-                                                //   see zero_copy.md.
+                                                //   see docs/documentation/zero_copy.md.
     ncclEpOverflowPolicy_t overflow_policy;     // HT recv-overflow policy (AUTO → TRAP, or DROP);
-                                                //   see overflow_policy.md.
+                                                //   see docs/documentation/overflow_policy.md.
     unsigned int num_topk;                      // Upper bound on per-token top-k across the group's
                                                 //   handles. Optional (0 = unset); required for HT
                                                 //   eager mode with the expert-major layout;
-                                                //   see eager_mode.md.
+                                                //   see docs/documentation/eager_mode.md.
     unsigned char padding_v2[4];                // Consumes V2 tail padding; future fields append after
 } ncclEpGroupConfig_t;
 
@@ -464,7 +464,7 @@ Under `ON`, HT requires both `ncclEpDispatch` `outputs->tokens` and `ncclEpCombi
 
 `ON` also selects a different expert-major algorithm (`kNvlinkDup` or `kLocalDup`
 instead of `kLocalPermute`), so it is a performance decision, not just a memory
-one. See [Zero-Copy Staging](zero_copy.md) for the full contract, the per-tensor
+one. See [Zero-Copy Staging](docs/documentation/zero_copy.md) for the full contract, the per-tensor
 input rules, and the LL differences.
 
 ***Eager mode (HT only)***
@@ -485,7 +485,7 @@ Eager mode requires `ncclEpGroupConfig_t::num_topk` with the expert-major layout
 It is not compatible with CUDA Graph capture of `ncclEpDispatch` and
 drop-on-overflow policy (see `NCCL_EP_OVERFLOW_DROP`).
 
-See the [Eager Mode guide](eager_mode.md) for the sizing
+See the [Eager Mode guide](docs/documentation/eager_mode.md) for the sizing
 protocol, per-layout differences, and a comparison against a fixed budget.
 
 ***Recv overflow policy (HT only)***
@@ -504,7 +504,7 @@ Routing is data-dependent, so a rank can be targeted by more tokens than the
   tensors.
 
 Overflow is detected during `ncclEpCreateHandle` / `ncclEpUpdateHandle`, not at
-dispatch. See the [Recv Overflow Policy guide](overflow_policy.md) for the two
+dispatch. See the [Recv Overflow Policy guide](docs/documentation/overflow_policy.md) for the two
 stages at which tokens can be dropped, the exact reported counts, and why
 `expert_counters` is an upper bound under `DROP`.
 
@@ -520,7 +520,7 @@ stages at which tokens can be dropped, the exact reported counts, and why
   - rank-major:   `[num_ranks, max_dispatch_tokens_per_rank, hidden]`.
 - Supports `send_only` (in `ncclEpDispatchConfig_t` / `ncclEpCombineConfig_t`) to enable computation/communication overlapping.
 - `zero_copy` is dispatch-only in LL; combine always stages. See
-  [Zero-Copy Staging](zero_copy.md).
+  [Zero-Copy Staging](docs/documentation/zero_copy.md).
 - Does not support dynamic `max_dispatch_tokens_per_rank` detection.
 
 ***`rdma_buffer_size` and lazy allocation (LL only)***
@@ -650,7 +650,7 @@ Notes:
 
 ## API Reference
 
-The complete C API reference lives in **[api_reference.md](api_reference.md)**,
+The complete C API reference lives in **[docs/documentation/api_reference.md](docs/documentation/api_reference.md)**,
 covering all 18 public entry points:
 
 | Group | Functions |

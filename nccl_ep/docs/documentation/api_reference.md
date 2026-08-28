@@ -36,7 +36,7 @@ ncclResult_t ncclEpGetVersion(int* version);
 
 Compare against `NCCL_EP_API_VERSION` before relying on a struct field
 introduced in a later release; see the ABI notes in the main
-[README](README.md#core-concepts).
+[README](../../README.md#core-concepts).
 
 ## Group Management
 
@@ -238,7 +238,7 @@ needs more memory than the current allocation, it reallocates. All ranks must
 then call it in lockstep with the same `(layout, num_topk)`, with no other
 communication in flight, and it must not appear inside a CUDA graph capture.
 An explicit `rdma_buffer_size` makes it purely local. See the
-[`rdma_buffer_size` notes](README.md#algorithm-related-configurations).
+[`rdma_buffer_size` notes](../../README.md#algorithm-related-configurations).
 
 ### `ncclEpUpdateHandle()`
 
