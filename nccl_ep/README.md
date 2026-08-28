@@ -28,7 +28,7 @@ implemented on top of NCCL Device API: Load-Store Accessible (LSA) and GPU-Initi
 - [API Reference](docs/documentation/api_reference.md) — every public entry point
 - [JIT Kernel Compilation](docs/documentation/jit.md) — runtime `nvcc` knobs, paths, and cache
 - [Quantization](docs/documentation/quantization.md) — dispatch and combine recipes
-- [Zero-Copy Staging](docs/documentation/zero_copy.md) — window-backed direct paths
+- [Zero-Copy](docs/documentation/zero_copy.md) — direct peer access to caller buffers
 - [Recv Overflow Policy](docs/documentation/overflow_policy.md) — HT trap / drop behavior
 - [HT Eager Mode](docs/documentation/eager_mode.md) — per-routing recv sizing
 
@@ -450,22 +450,13 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
   - Tokens arrive pre-sorted by expert; the caller feeds each expert's slice directly without needing `topk_idx` for routing.
   - Set `ncclEpLayoutInfo_t.expert_counters` (1D tensor, length = `num_local_experts`) to receive per-expert received token counts.
 
-***Zero-copy staging***
+***Zero-copy***
 
-`ncclEpGroupConfig_t::zero_copy` controls whether payloads move through
-library-owned staging or directly through caller tensors backed by NCCL windows.
-Window-backed tensors are used directly whenever the path supports it, in **any**
-mode; `NCCL_EP_ZERO_COPY_ON` additionally makes windows mandatory and drops the
-token staging allocation. `AUTO` and `OFF` behave identically.
-
-Under `ON`, HT requires both `ncclEpDispatch` `outputs->tokens` and `ncclEpCombine`
-`inputs->tokens` to be window-backed; a plain device pointer returns
-`ncclInvalidArgument` rather than falling back to staging.
-
-`ON` also selects a different expert-major algorithm (`kNvlinkDup` or `kLocalDup`
-instead of `kLocalPermute`), so it is a performance decision, not just a memory
-one. See [Zero-Copy Staging](docs/documentation/zero_copy.md) for the full contract, the per-tensor
-input rules, and the LL differences.
+Dispatch and combine normally move payloads through library-owned staging
+buffers. A caller can enable direct peer access to input/output buffers by
+attaching a NCCL window (`ncclCommWindowRegister`) to the respective tensor.
+Refer to the [Zero-Copy](docs/documentation/zero_copy.md) documentation for more
+details.
 
 ***Eager mode (HT only)***
 
@@ -520,7 +511,7 @@ stages at which tokens can be dropped, the exact reported counts, and why
   - rank-major:   `[num_ranks, max_dispatch_tokens_per_rank, hidden]`.
 - Supports `send_only` (in `ncclEpDispatchConfig_t` / `ncclEpCombineConfig_t`) to enable computation/communication overlapping.
 - `zero_copy` is dispatch-only in LL; combine always stages. See
-  [Zero-Copy Staging](docs/documentation/zero_copy.md).
+  [Zero-Copy](docs/documentation/zero_copy.md).
 - Does not support dynamic `max_dispatch_tokens_per_rank` detection.
 
 ***`rdma_buffer_size` and lazy allocation (LL only)***

@@ -4,7 +4,7 @@ Complete reference for the NCCL EP public C API. Every entry point exported by
 `nccl_ep.h` is listed here.
 
 Behavioral topics are covered in dedicated guides rather than repeated per
-function: [Quantization](quantization.md), [Zero-Copy Staging](zero_copy.md),
+function: [Quantization](quantization.md), [Zero-Copy](zero_copy.md),
 [Recv Overflow Policy](overflow_policy.md), and [HT Eager Mode](eager_mode.md).
 
 ## Contents
