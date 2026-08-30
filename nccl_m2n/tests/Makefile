@@ -42,7 +42,9 @@ include gtest.mk
 # test_helpers.cu is the only nvcc-required TU; both binaries link it in.
 TEST_HDRS := $(TESTSDIR)/test_helpers.h $(TESTSDIR)/basic_api_test_core.h
 TEST_HELPERS_SRC := $(TESTSDIR)/test_helpers.cu
-TEST_MPI_SRCS    := $(TESTSDIR)/basic_api_test_mpi.cc   $(TEST_HELPERS_SRC)
+TEST_MPI_SRCS    := $(TESTSDIR)/basic_api_test_mpi.cc   \
+                    $(TESTSDIR)/pipe_graph_path_test.cc \
+                    $(TEST_HELPERS_SRC)
 TEST_LOCAL_SRCS  := $(TESTSDIR)/basic_api_test_local.cc \
                     $(TESTSDIR)/pack_staging_pool_test.cc \
                     $(TEST_HELPERS_SRC)

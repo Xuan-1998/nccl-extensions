@@ -163,7 +163,7 @@ ncclResult_t reshardGetOrCreateDevCommWithRequirements(ncclComm_t comm, int barr
   ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   if (barrierKind == RESHARD_DEVCOMM_BARRIER_WORLD) {
     reqs.worldGinBarrierCount = barrierCount;
-  } else {
+  } else if (barrierKind == RESHARD_DEVCOMM_BARRIER_HYBRID) {
     reqs.barrierCount = barrierCount;
   }
   reqs.ginSignalCount = ginSignalCount;

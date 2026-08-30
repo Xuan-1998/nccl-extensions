@@ -136,6 +136,7 @@ endif()
 if(MPI_FOUND)
   add_executable(basic_api_test_mpi
       basic_api_test_mpi.cc
+      pipe_graph_path_test.cc
       test_helpers.cu
   )
   target_include_directories(basic_api_test_mpi PRIVATE

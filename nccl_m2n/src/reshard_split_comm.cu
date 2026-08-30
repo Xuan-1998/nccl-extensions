@@ -155,8 +155,7 @@ struct CommACacheEntry {
  * parent and split launches; split topology is in meshSignature. */
 struct PersistentControlSlotEntry {
   ncclComm_t parent;
-  ReshardStagingMeshSignature meshSignature;
-  ReshardStagingChannelSignature channelSignature;
+  ReshardStagingPipeSignature signature;
   int slot;
   bool used;
 };
@@ -605,8 +604,7 @@ void stagingPipeControlSlotCacheReset() {
 }
 
 ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
-                                                     const ReshardStagingMeshSignature& meshSignature,
-                                                     const ReshardStagingChannelSignature& channelSignature, int rank,
+                                                     const ReshardStagingPipeSignature& signature, int rank,
                                                      int* outSlot) {
   NCCL_M2N_CHECK_ARG(parentComm != nullptr && outSlot != nullptr, rank,
                      "PIPE persistent control slot requires parent comm and output");
@@ -617,7 +615,7 @@ ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
     if (!samePersistentControlPool(e, parentComm)) {
       continue;
     }
-    if (e.meshSignature == meshSignature && e.channelSignature == channelSignature) {
+    if (e.signature == signature) {
       *outSlot = e.slot;
       return ncclSuccess;
     }
@@ -641,8 +639,7 @@ ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
   PersistentControlSlotEntry e;
   memset(&e, 0, sizeof(e));
   e.parent = parentComm;
-  e.meshSignature = meshSignature;
-  e.channelSignature = channelSignature;
+  e.signature = signature;
   e.slot = slot;
   e.used = true;
   gPersistentControlSlots[gPersistentControlSlotCount++] = e;
@@ -857,8 +854,9 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
 }
 
 ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
-                                         int numCtas, int ginSignalCountA, int ginCounterCountA, int signalsPerSlotB,
-                                         int countersPerSlotB, int ctxPerSlotB, int maxConcurrency, cudaStream_t stream,
+                                         int barrierCount, ReshardDevCommBarrierKind barrierKind, int ginSignalCountA,
+                                         int ginCounterCountA, int signalsPerSlotB, int countersPerSlotB,
+                                         int ctxPerSlotB, int maxConcurrency, cudaStream_t stream,
                                          ncclWindow_t* outWindowA, ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
                                          ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB,
                                          ReshardDevCommUse* outDevCommBUse) {
@@ -897,8 +895,8 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
                        "reshardSplitEnsureResources: commA DevComm and use outputs must be supplied together");
     if (needDevCommA) {
       NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
-        sc->commA, numCtas, ginSignalCountA, ginCounterCountA, RESHARD_DEVCOMM_BARRIER_HYBRID,
-        reshardGetGinContextCount(), NCCL_GIN_CONNECTION_FULL, stream, outDevCommA, outDevCommAUse));
+        sc->commA, barrierCount, ginSignalCountA, ginCounterCountA, barrierKind, reshardGetGinContextCount(),
+        NCCL_GIN_CONNECTION_FULL, stream, outDevCommA, outDevCommAUse));
     }
   }
 
@@ -927,15 +925,15 @@ ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stag
     const int totalSignals = signalsPerSlotB * conc;
     const int totalCounters = countersPerSlotB * conc;
     const int totalContexts = ctxPerSlotB * conc;
-    const int totalBarriers = numCtas * conc;
+    const int totalBarriers = barrierCount * conc;
 
     const bool needDevCommB = outDevCommB != nullptr || outDevCommBUse != nullptr;
     NCCL_M2N_CHECK_ARG(!needDevCommB || (outDevCommB != nullptr && outDevCommBUse != nullptr), sc->parentRank,
                        "reshardSplitEnsureResources: commB DevComm and use outputs must be supplied together");
     if (needDevCommB) {
       NCCL_M2N_CHECK(reshardGetOrCreateDevCommWithRequirements(
-        sc->commB, totalBarriers, totalSignals, totalCounters, RESHARD_DEVCOMM_BARRIER_HYBRID, totalContexts,
-        NCCLM2N_GIN_RAIL_CONNECTION, stream, outDevCommB, outDevCommBUse));
+        sc->commB, totalBarriers, totalSignals, totalCounters, barrierKind, totalContexts, NCCLM2N_GIN_RAIL_CONNECTION,
+        stream, outDevCommB, outDevCommBUse));
     }
   }
 

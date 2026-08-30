@@ -46,6 +46,7 @@
 
 struct ReshardDevCommUse;
 struct ncclDevComm;
+enum ReshardDevCommBarrierKind : int;
 
 /* Rail GIN connection type for the generator-only sub-comm (commB).
  * The rest of the library only ever requests NCCL_GIN_CONNECTION_FULL.
@@ -152,19 +153,7 @@ struct ReshardStagingMeshSignature {
   }
 };
 
-/* Resolved partition of a mesh's canonical peer graph. This intentionally
- * contains no peer identity or tensor layout: those belong to the mesh and
- * tensor signatures respectively. A different active channel count changes
- * the meaning of channel-indexed persistent counters. */
-struct ReshardStagingChannelSignature {
-  int activeChannelCount;
-
-  bool operator==(const ReshardStagingChannelSignature& other) const {
-    return activeChannelCount == other.activeChannelCount;
-  }
-};
-
-/* Tensor-local identity for immutable PIPE plans.  It intentionally omits
+/* Tensor-shape identity for immutable PIPE plans. It intentionally omits
  * mesh and split topology, which belong exclusively to ReshardStagingMeshSignature. */
 struct ReshardStagingTensorSignature {
   int srcNdims;
@@ -185,6 +174,19 @@ struct ReshardStagingTensorSignature {
       }
     }
     return true;
+  }
+};
+
+/* Canonical identity for a PIPE transfer. Every rank receives the same mesh
+ * and tensor descriptors, while its cached plan retains rank-local channels
+ * and peer maps. Keeping this identity rank-uniform makes persistent GIN
+ * control-slot selection agree across every edge. */
+struct ReshardStagingPipeSignature {
+  ReshardStagingMeshSignature meshSignature;
+  ReshardStagingTensorSignature tensorSignature;
+
+  bool operator==(const ReshardStagingPipeSignature& other) const {
+    return meshSignature == other.meshSignature && tensorSignature == other.tensorSignature;
   }
 };
 
@@ -299,8 +301,7 @@ ncclResult_t reshardGetOrCreateSplitComms(ncclComm_t comm, const ncclMesh_t* src
  * an active split path cannot alias the parent path. */
 int reshardGetPersistentControlSlotCount();
 ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
-                                                     const ReshardStagingMeshSignature& meshSignature,
-                                                     const ReshardStagingChannelSignature& channelSignature, int rank,
+                                                     const ReshardStagingPipeSignature& signature, int rank,
                                                      int* outSlot);
 
 /* Ensure (and cache) the per-staging-buffer windows + optional sized DevComms
@@ -313,8 +314,9 @@ ncclResult_t reshardGetOrCreatePersistentControlSlot(ncclComm_t parentComm,
  * entries include its slot-partitioned resource requirements, so differing
  * PACK and PIPE layouts never replace an in-flight DevComm. */
 ncclResult_t reshardSplitEnsureResources(const ReshardSplitComms* sc, void* stagingBuffer, size_t stagingCapacity,
-                                         int numCtas, int ginSignalCountA, int ginCounterCountA, int signalsPerSlotB,
-                                         int countersPerSlotB, int ctxPerSlotB, int maxConcurrency, cudaStream_t stream,
+                                         int barrierCount, ReshardDevCommBarrierKind barrierKind, int ginSignalCountA,
+                                         int ginCounterCountA, int signalsPerSlotB, int countersPerSlotB,
+                                         int ctxPerSlotB, int maxConcurrency, cudaStream_t stream,
                                          ncclWindow_t* outWindowA, ncclWindow_t* outWindowB, ncclDevComm* outDevCommA,
                                          ReshardDevCommUse* outDevCommAUse, ncclDevComm* outDevCommB,
                                          ReshardDevCommUse* outDevCommBUse);

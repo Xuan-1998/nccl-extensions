@@ -38,9 +38,7 @@ extern "C" {
 #endif
 
 struct StagingPipePlanCacheEntry {
-  ReshardStagingMeshSignature meshSignature;
-  ReshardStagingChannelSignature channelSignature;
-  ReshardStagingTensorSignature tensorSignature;
+  ReshardStagingPipeSignature signature;
 
   /* Host/device copies of the immutable PIPE launch metadata.  Runtime
    * values that change every call stay in StagingPipeCallParams and are
@@ -83,8 +81,8 @@ struct StagingBufferState {
   void* hostRmaPipeline; /* Host-RMA CUDA streams/events, retained across plans. */
 
   /* PIPE plan entries are associative. Persistent-control slots isolate
-   * cursor/counter state; plans are keyed by mesh, active channels, and tensor
-   * metadata because prepared offsets depend on all three. */
+   * cursor/counter state; plans use the same rank-uniform transfer identity
+   * so every endpoint selects the same GIN control-slot offset. */
   StagingPipePlanCacheEntry pipePlanCache[STAGING_PIPE_CONTROL_SLOTS];
   int pipePlanCacheNextVictim;
 };

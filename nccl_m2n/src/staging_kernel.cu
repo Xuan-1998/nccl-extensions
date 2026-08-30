@@ -567,91 +567,37 @@ __device__ __forceinline__ ncclWindow_t pipe_edge_rdma_window(const StagingKerne
   return pipe_edge_uses_split_b(edge) ? params->rdmaWindowB : params->rdmaWindow;
 }
 
-__device__ __forceinline__ void staging_peer_chunk_range(const StagingPeerInfo& peer, size_t chunkSize,
-                                                         size_t* chunkStart, size_t* chunkEnd) {
-  (void)chunkSize;
+__device__ __forceinline__ void staging_peer_chunk_range(const StagingPeerInfo& peer, size_t* chunkStart,
+                                                         size_t* chunkEnd) {
   *chunkStart = peer.chunkStart;
   *chunkEnd = peer.chunkEnd;
 }
 
-__device__ __forceinline__ void pipe_edge_chunk_range(const StagingPipePeerEdge& edge, size_t chunkSize,
-                                                      size_t* chunkStart, size_t* chunkEnd) {
-  (void)chunkSize;
+__device__ __forceinline__ void pipe_edge_chunk_range(const StagingPipePeerEdge& edge, size_t* chunkStart,
+                                                      size_t* chunkEnd) {
   *chunkStart = edge.chunkStart;
   *chunkEnd = edge.chunkEnd;
 }
 
-#ifdef STAGING_KERNEL_TRACE
-__device__ __forceinline__ void pipe_trace_spin(StagingKernelParams* params, uint64_t epoch, int channel_id,
-                                                const char* label, int peer, size_t progress,
-                                                unsigned long long start_clock, bool* reported) {
-  unsigned long long elapsed = clock64() - start_clock;
-  if (!*reported && elapsed > 2000000000ULL) {
-    printf("[PIPEDBG] rank=%d epoch=%llu ch=%d spin label=%s peer=%d progress=%llu elapsed_cycles=%llu\n",
-           params->myRank, (unsigned long long)epoch, channel_id, label, peer, (unsigned long long)progress, elapsed);
-    *reported = true;
-  }
-  if (elapsed > 20000000000ULL) {
-    printf("[PIPEDBG] rank=%d epoch=%llu ch=%d trap label=%s peer=%d progress=%llu elapsed_cycles=%llu\n",
-           params->myRank, (unsigned long long)epoch, channel_id, label, peer, (unsigned long long)progress, elapsed);
-    asm volatile("trap;");
-  }
-}
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+#ifndef STAGING_PIPE_SYNC_TIMEOUT_CYCLES
+#define STAGING_PIPE_SYNC_TIMEOUT_CYCLES 10000000000ULL
+#endif
 
 #define PIPE_SPIN_INIT(name) \
-  unsigned long long name##_spin_start = clock64(); \
-  bool name##_spin_reported = false
-#define PIPE_SPIN_CHECK(name, params, epoch, channel_id, peer, progress) \
-  pipe_trace_spin((params), (epoch), (channel_id), #name, (peer), (size_t)(progress), name##_spin_start, \
-                  &name##_spin_reported)
+  unsigned long long name##_spin_start = clock64()
+#define PIPE_SYNC_TIMEOUT(name, params, epoch, channel_id, peer, progress, expected, observed) \
+  do { \
+    const unsigned long long name##_spin_elapsed = clock64() - name##_spin_start; \
+    if (name##_spin_elapsed > STAGING_PIPE_SYNC_TIMEOUT_CYCLES) { \
+      staging_pipe_sync_timeout((params), (epoch), (channel_id), #name, (peer), (size_t)(progress), \
+                                (uint64_t)(expected), (uint64_t)(observed), name##_spin_elapsed); \
+    } \
+  } while (0)
 
-__device__ __forceinline__ void pipe_rdma_wait_for_credits_debug(ncclGin& gin, StagingRegion& region,
-                                                                 StagingFlowCtrl& fc, StagingKernelParams* params,
-                                                                 uint64_t epoch, int channel_id, int peer,
-                                                                 size_t progress) {
-  PIPE_SPIN_INIT(rdma_credit_wait);
-  if (fc.isLocal) {
-    char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
-    uint64_t* local_head_ptr = (uint64_t*)(staging_base + fc.localHeadOffset);
-    while ((fc.shadowTail - ld_acquire_gpu(local_head_ptr)) >= (uint64_t)fc.peerNumSlots) {
-      PIPE_SPIN_CHECK(rdma_credit_wait, params, epoch, channel_id, peer, progress);
-    }
-  } else {
-    while ((fc.shadowTail - (gin.readSignal(fc.localHeadSignal) - fc.headSignalBase)) >= (uint64_t)fc.peerNumSlots) {
-      PIPE_SPIN_CHECK(rdma_credit_wait, params, epoch, channel_id, peer, progress);
-    }
-  }
-}
-
-__device__ __forceinline__ void pipe_lsa_wait_for_credits_debug(StagingRegion& region, StagingFlowCtrl& fc,
-                                                                StagingKernelParams* params, uint64_t epoch,
-                                                                int channel_id, int peer, size_t progress) {
-  PIPE_SPIN_INIT(lsa_credit_wait);
-  char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
-  uint64_t* local_head_ptr = (uint64_t*)(staging_base + fc.localHeadOffset);
-  while ((fc.shadowTail - (ld_acquire(local_head_ptr, fc.isLocal) - fc.lsaHeadBase)) >= (uint64_t)fc.peerNumSlots) {
-    PIPE_SPIN_CHECK(lsa_credit_wait, params, epoch, channel_id, peer, progress);
-  }
-}
-
-__device__ __forceinline__ void pipe_lsa_rdma_wait_for_credits_debug(ncclGin& gin, StagingFlowCtrl& fc,
-                                                                     uint64_t baseOffset, StagingKernelParams* params,
-                                                                     uint64_t epoch, int channel_id, int peer,
-                                                                     size_t progress) {
-  PIPE_SPIN_INIT(lsa_rdma_credit_wait);
-  while ((fc.shadowTail - gin.readCounter(fc.localPutCounter) - baseOffset) >= (uint64_t)fc.peerNumSlots) {
-    PIPE_SPIN_CHECK(lsa_rdma_credit_wait, params, epoch, channel_id, peer, progress);
-  }
-}
 #else
 #define PIPE_SPIN_INIT(name) ((void)0)
-#define PIPE_SPIN_CHECK(name, params, epoch, channel_id, peer, progress) ((void)0)
-#define pipe_rdma_wait_for_credits_debug(gin, region, fc, params, epoch, channel_id, peer, progress) \
-  rdma_wait_for_credits((gin), (region), (fc))
-#define pipe_lsa_wait_for_credits_debug(region, fc, params, epoch, channel_id, peer, progress) \
-  lsa_wait_for_credits((region), (fc))
-#define pipe_lsa_rdma_wait_for_credits_debug(gin, fc, baseOffset, params, epoch, channel_id, peer, progress) \
-  lsa_rdma_wait_for_credits((gin), (fc), (baseOffset))
+#define PIPE_SYNC_TIMEOUT(name, params, epoch, channel_id, peer, progress, expected, observed) ((void)0)
 #endif
 
 // ============================================================================
@@ -718,10 +664,10 @@ struct PipeGeneratorLaunchMap {
   int phase;
 };
 
-__device__ __forceinline__ PipeChunkRange pipe_chunk_range(const StagingPipePeerEdge& edge, size_t chunkSize) {
+__device__ __forceinline__ PipeChunkRange pipe_chunk_range(const StagingPipePeerEdge& edge) {
   PipeChunkRange range{0, 0, 0};
   if (pipe_edge_active(edge)) {
-    pipe_edge_chunk_range(edge, chunkSize, &range.start, &range.end);
+    pipe_edge_chunk_range(edge, &range.start, &range.end);
     range.count = range.end - range.start;
   }
   return range;
@@ -958,8 +904,7 @@ __global__ __launch_bounds__(PIPE_TRAINER_THREADS, 1) void StagingReshardKernel_
   ncclTeam worldA = ncclTeamWorld(devCommA);
   ncclTeam worldB = ncclTeamWorld(devCommB);
   StagingRegion rdma_region = params->rdmaRegions[channel_id];
-  const size_t chunkSize = params->chunkSize;
-#ifdef STAGING_KERNEL_TRACE
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
   const uint64_t trace_epoch = call.epoch;
 #endif
 
@@ -992,13 +937,18 @@ __global__ __launch_bounds__(PIPE_TRAINER_THREADS, 1) void StagingReshardKernel_
         rdma_fc.shadowTail = staging_cursor_load(rdma_region, rdma_fc.cursorTailOffset);
         rdma_fc.headSignalBase = 0;
 
-        const PipeChunkRange chunks = pipe_chunk_range(target, chunkSize);
+        const size_t chunkSize = target.logicalChunkSize;
+        const PipeChunkRange chunks = pipe_chunk_range(target);
 
         size_t chunks_done = 0;
         while (chunks_done < chunks.count) {
           size_t first_recv_offset = 0;
           int num_new = 0;
+          PIPE_SPIN_INIT(rdma_staging_poll_wait);
           while ((num_new = staging_poll(rdma_region, local_fc, &first_recv_offset)) == 0) {
+            PIPE_SYNC_TIMEOUT(rdma_staging_poll_wait, params, trace_epoch, channel_id, target.peerWorldRank,
+                              chunks_done, local_fc.lastTailVal + 1,
+                              staging_cursor_load(rdma_region, local_fc.localTailOffset) - local_fc.lsaTailBase);
           }
           int batch = pipe_clip_batch(num_new, chunks.count - chunks_done);
           int first_slot = pipe_slot_from_offset(local_fc, first_recv_offset);
@@ -1009,8 +959,12 @@ __global__ __launch_bounds__(PIPE_TRAINER_THREADS, 1) void StagingReshardKernel_
             size_t byte_start = (chunks.start + chunks_done + (size_t)bi) * chunkSize;
             size_t remaining = target.totalBytes - byte_start;
             size_t chunk_bytes = pipe_min_size(chunkSize, remaining);
-            pipe_rdma_wait_for_credits_debug(target_gin, rdma_region, rdma_fc, params, trace_epoch, channel_id, t,
-                                             chunks_done + (size_t)bi);
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+            rdma_wait_for_credits_debug(target_gin, rdma_region, rdma_fc, params, trace_epoch, channel_id,
+                                        "rdma_credit_wait", target.peerWorldRank, chunks_done + (size_t)bi);
+#else
+            rdma_wait_for_credits(target_gin, rdma_region, rdma_fc);
+#endif
             int remote_slot = (int)(rdma_fc.shadowTail % (uint64_t)rdma_fc.peerNumSlots);
             size_t remote_offset = rdma_fc.peerDataOffset + (size_t)remote_slot * rdma_fc.peerChunkSize;
             target_gin.put(target_world, target.peerWorldRank, target_window, remote_offset, target_window,
@@ -1023,7 +977,10 @@ __global__ __launch_bounds__(PIPE_TRAINER_THREADS, 1) void StagingReshardKernel_
         }
         if (chunks.count > 0) {
           uint64_t counter_done = local_put_counter_base + (uint64_t)chunks.count;
+          PIPE_SPIN_INIT(rdma_put_counter_wait);
           while (target_gin.readCounter(local_fc.localPutCounter) < counter_done) {
+            PIPE_SYNC_TIMEOUT(rdma_put_counter_wait, params, trace_epoch, channel_id, target.peerWorldRank,
+                              chunks_done, counter_done, target_gin.readCounter(local_fc.localPutCounter));
           }
         }
       }
@@ -1057,13 +1014,19 @@ __global__ __launch_bounds__(PIPE_TRAINER_THREADS, 1) void StagingReshardKernel_
         local_counter_base_offset = fc.shadowTail - target_gin.readCounter(fc.localPutCounter);
       }
 
-      const PipeChunkRange chunks = pipe_chunk_range(target, chunkSize);
+      const size_t chunkSize = target.logicalChunkSize;
+      const PipeChunkRange chunks = pipe_chunk_range(target);
 
       for (size_t chunk = 0; chunk < chunks.count; chunk++) {
         size_t global_chunk = chunks.start + chunk;
         if (is_root_warp && lane_id == 0) {
           uint64_t baseOffset = local_counter_base_offset;
-          pipe_lsa_rdma_wait_for_credits_debug(target_gin, fc, baseOffset, params, trace_epoch, channel_id, t, chunk);
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+          lsa_rdma_wait_for_credits_debug(target_gin, fc, baseOffset, params, trace_epoch, channel_id,
+                                          "lsa_rdma_credit_wait", target.peerWorldRank, chunk);
+#else
+          lsa_rdma_wait_for_credits(target_gin, fc, baseOffset);
+#endif
           pack_slot = (int)(fc.shadowTail % (uint64_t)fc.peerNumSlots);
         }
         barrier_sync_subset(PIPE_TRAINER_PACK_BARRIER_ID, PIPE_TRAINER_PACK_THREADS);
@@ -1159,8 +1122,7 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
   StagingRegion lsa_region = params->lsaRegions[channel_id];
   char* rdma_staging_base = (char*)ncclGetLocalPointer(rdma_region.window, 0);
   char* user_dst = (char*)call.dstBuffer;
-  const size_t chunkSize = params->chunkSize;
-#ifdef STAGING_KERNEL_TRACE
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
   const uint64_t trace_epoch = call.epoch;
 #endif
 
@@ -1177,7 +1139,8 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
         const bool active = pipe_edge_active(source);
         ncclGin& source_gin = pipe_edge_uses_split_b(source) ? ginB : ginA;
         ncclTeam source_world = pipe_edge_uses_split_b(source) ? worldB : worldA;
-        const PipeChunkRange chunks = pipe_chunk_range(source, chunkSize);
+        const size_t chunkSize = source.logicalChunkSize;
+        const PipeChunkRange chunks = pipe_chunk_range(source);
 
         if (threadIdx.x == 0) {
           q_tail = 0;
@@ -1231,7 +1194,9 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
               int num_new = 0;
               PIPE_SPIN_INIT(rdma_poll_wait);
               while ((num_new = rdma_poll(source_gin, rdma_region, poll_fc, &first_recv_offset)) == 0) {
-                PIPE_SPIN_CHECK(rdma_poll_wait, params, trace_epoch, channel_id, s, chunks_done);
+                PIPE_SYNC_TIMEOUT(rdma_poll_wait, params, trace_epoch, channel_id, s, chunks_done,
+                                  poll_fc.lastTailVal + 1,
+                                  source_gin.readSignal(poll_fc.localTailSignal) - poll_fc.tailSignalBase);
               }
               int batch = pipe_clip_batch(num_new, chunks.count - chunks_done);
               rdma_ctrl_batch = batch;
@@ -1246,7 +1211,8 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
               if (lane_id == 0) {
                 PIPE_SPIN_INIT(rdma_queue_wait);
                 while ((q_tail - q_done) >= (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH) {
-                  PIPE_SPIN_CHECK(rdma_queue_wait, params, trace_epoch, channel_id, s, logical_chunk);
+                  PIPE_SYNC_TIMEOUT(rdma_queue_wait, params, trace_epoch, channel_id, source.peerWorldRank,
+                                    logical_chunk, q_tail - PIPE_GENERATOR_QUEUE_DEPTH + 1, q_done);
                 }
                 unsigned int q_idx = q_tail % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH;
                 int this_slot = (first_slot + bi) % poll_fc.peerNumSlots;
@@ -1268,8 +1234,12 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
                   ncclGin& ring_gin = pipe_edge_uses_split_b(ring_target) ? ginB : ginA;
                   ncclTeam ring_world = pipe_edge_uses_split_b(ring_target) ? worldB : worldA;
                   ncclWindow_t ring_window = pipe_edge_rdma_window(params, ring_target);
-                  pipe_rdma_wait_for_credits_debug(ring_gin, rdma_region, ring_fc, params, trace_epoch, channel_id,
-                                                   ring_idx, logical_chunk);
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+                  rdma_wait_for_credits_debug(ring_gin, rdma_region, ring_fc, params, trace_epoch, channel_id,
+                                              "rdma_credit_wait", ring_target.peerWorldRank, logical_chunk);
+#else
+                  rdma_wait_for_credits(ring_gin, rdma_region, ring_fc);
+#endif
                   int remote_slot = (int)(ring_fc.shadowTail % (uint64_t)ring_fc.peerNumSlots);
                   size_t remote_offset = ring_fc.peerDataOffset + (size_t)remote_slot * ring_fc.peerChunkSize;
                   ring_gin.put(ring_world, ring_target_rank, ring_window, remote_offset, ring_window, recv_offset,
@@ -1298,8 +1268,12 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
                   my_fwd_fc.shadowTail = staging_cursor_load(lsa_region, my_fwd_fc.cursorTailOffset);
                   my_fwd_fc.lastTailVal = my_fwd_fc.shadowTail;
                   my_fwd_fc.localHeadVal = staging_cursor_load(lsa_region, my_fwd_fc.localHeadOffset);
-                  pipe_lsa_wait_for_credits_debug(lsa_region, my_fwd_fc, params, trace_epoch, channel_id, fwd_tgt_idx,
-                                                  chunks_done + (size_t)bi);
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+                  lsa_wait_for_credits_debug(lsa_region, my_fwd_fc, params, trace_epoch, channel_id,
+                                             "lsa_follower_credit_wait", fwd_target.peerWorldRank, logical_chunk);
+#else
+                  lsa_wait_for_credits(lsa_region, my_fwd_fc);
+#endif
                   lsa_signal(lsa_region, my_fwd_fc);
                   staging_cursor_store(lsa_region, my_fwd_fc.cursorTailOffset, my_fwd_fc.shadowTail);
                 }
@@ -1313,7 +1287,8 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
             if (lane_id == 0) {
               PIPE_SPIN_INIT(rdma_q_done_wait);
               while (q_done < (unsigned int)chunks_done) {
-                PIPE_SPIN_CHECK(rdma_q_done_wait, params, trace_epoch, channel_id, s, chunks_done);
+                PIPE_SYNC_TIMEOUT(rdma_q_done_wait, params, trace_epoch, channel_id, source.peerWorldRank,
+                                  chunks_done, chunks_done, q_done);
               }
             }
             if constexpr (DoLsaForward) {
@@ -1333,18 +1308,21 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
                 uint64_t* head_ptr = (uint64_t*)(lsa_staging + my_fwd_fc.localHeadOffset);
                 PIPE_SPIN_INIT(rdma_fwd_head_wait);
                 while ((ld_acquire(head_ptr, my_fwd_fc.isLocal) - my_fwd_fc.lsaHeadBase) < desired_tail) {
-                  PIPE_SPIN_CHECK(rdma_fwd_head_wait, params, trace_epoch, channel_id, fwd_tgt_idx, chunks_done);
+                  PIPE_SYNC_TIMEOUT(rdma_fwd_head_wait, params, trace_epoch, channel_id,
+                                    fwd_target.peerWorldRank, chunks_done, desired_tail,
+                                    ld_acquire(head_ptr, my_fwd_fc.isLocal) - my_fwd_fc.lsaHeadBase);
                 }
               }
             }
             __syncwarp();
             if (lane_id == 0) {
               if (ring_active) {
-                PIPE_SPIN_INIT(rdma_ring_counter_wait);
                 const StagingPipePeerEdge& ring_target = pipe_plan->rdmaTargets[channel_id][ring_idx].peer;
                 ncclGin& ring_gin = pipe_edge_uses_split_b(ring_target) ? ginB : ginA;
+                PIPE_SPIN_INIT(rdma_ring_counter_wait);
                 while (ring_gin.readCounter(ring_fc.localPutCounter) < ring_counter_val) {
-                  PIPE_SPIN_CHECK(rdma_ring_counter_wait, params, trace_epoch, channel_id, ring_idx, chunks_done);
+                  PIPE_SYNC_TIMEOUT(rdma_ring_counter_wait, params, trace_epoch, channel_id, ring_target.peerWorldRank,
+                                    chunks_done, ring_counter_val, ring_gin.readCounter(ring_fc.localPutCounter));
                 }
               }
               release_fc.lastTailVal = rdma_release_head_base + (uint64_t)chunks_done;
@@ -1364,7 +1342,8 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
             if (is_unpack_leader) {
               PIPE_SPIN_INIT(rdma_unpack_queue_wait);
               while (q_tail <= (unsigned int)chunk) {
-                PIPE_SPIN_CHECK(rdma_unpack_queue_wait, params, trace_epoch, channel_id, s, chunk);
+                PIPE_SYNC_TIMEOUT(rdma_unpack_queue_wait, params, trace_epoch, channel_id, source.peerWorldRank,
+                                  chunk, chunk + 1, q_tail);
               }
               __threadfence_block();
               cur_desc = q_desc[chunk % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH];
@@ -1407,7 +1386,8 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
       for (int s = 0; s < params->numLsaSources; s++) {
         const StagingPipePeerEdge& source = pipe_plan->lsaSources[channel_id][s];
         const bool active = pipe_edge_active(source);
-        const PipeChunkRange chunks = pipe_chunk_range(source, chunkSize);
+        const size_t chunkSize = source.logicalChunkSize;
+        const PipeChunkRange chunks = pipe_chunk_range(source);
         const int leader_local_rank = source.peerLocalRank;
 
         if (threadIdx.x == 0) {
@@ -1444,7 +1424,9 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
             int num_new = 0;
             PIPE_SPIN_INIT(lsa_poll_wait);
             while ((num_new = staging_poll(lsa_region, poll_fc, &first_recv_offset)) == 0) {
-              PIPE_SPIN_CHECK(lsa_poll_wait, params, trace_epoch, channel_id, s, chunks_done);
+              PIPE_SYNC_TIMEOUT(lsa_poll_wait, params, trace_epoch, channel_id, s, chunks_done,
+                                poll_fc.lastTailVal + 1,
+                                staging_cursor_load(lsa_region, poll_fc.localTailOffset) - poll_fc.lsaTailBase);
             }
             int batch = pipe_clip_batch(num_new, chunks.count - chunks_done);
             int first_slot = pipe_slot_from_offset(poll_fc, first_recv_offset);
@@ -1464,13 +1446,14 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
               while (tile_offset < this_bytes) {
                 PIPE_SPIN_INIT(lsa_queue_wait);
                 while ((q_tail - q_done) >= (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH) {
-                  PIPE_SPIN_CHECK(lsa_queue_wait, params, trace_epoch, channel_id, s, logical_chunk);
+                  PIPE_SYNC_TIMEOUT(lsa_queue_wait, params, trace_epoch, channel_id, source.peerWorldRank,
+                                    logical_chunk, q_tail - PIPE_GENERATOR_QUEUE_DEPTH + 1, q_done);
                 }
                 unsigned int q_idx = q_tail % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH;
                 size_t tile_bytes = pipe_min_size((size_t)TmaTileSize, this_bytes - tile_offset);
                 char* tma_tile_buf = tma_tile_base + (size_t)q_idx * (size_t)TmaTileSize;
-                staging_tma_load(tma_tile_buf, remote_src + tile_offset, &tma_mbar[q_idx], (int)tile_bytes);
                 staging_tma_mbarrier_expect(&tma_mbar[q_idx], (int)tile_bytes);
+                staging_tma_load(tma_tile_buf, remote_src + tile_offset, &tma_mbar[q_idx], (int)tile_bytes);
 
                 q_desc[q_idx].staging_offset = 0;
                 q_desc[q_idx].byte_start = byte_start + tile_offset;
@@ -1486,7 +1469,8 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
 
             PIPE_SPIN_INIT(lsa_done_chunks_wait);
             while (q_done_chunks < (unsigned int)chunks_done) {
-              PIPE_SPIN_CHECK(lsa_done_chunks_wait, params, trace_epoch, channel_id, s, chunks_done);
+              PIPE_SYNC_TIMEOUT(lsa_done_chunks_wait, params, trace_epoch, channel_id, source.peerWorldRank,
+                                chunks_done, chunks_done, q_done_chunks);
             }
             release_fc.lastTailVal = release_head_base + (uint64_t)chunks_done;
             lsa_release_flush(lsa_region, release_fc);
@@ -1506,11 +1490,23 @@ __global__ __launch_bounds__(PIPE_GENERATOR_THREADS, 1) void StagingReshardKerne
             if (is_unpack_leader) {
               PIPE_SPIN_INIT(lsa_unpack_queue_wait);
               while (q_tail <= (unsigned int)tiles_done) {
-                PIPE_SPIN_CHECK(lsa_unpack_queue_wait, params, trace_epoch, channel_id, s, tiles_done);
+                PIPE_SYNC_TIMEOUT(lsa_unpack_queue_wait, params, trace_epoch, channel_id, source.peerWorldRank,
+                                  tiles_done, tiles_done + 1, q_tail);
               }
               __threadfence_block();
               cur_desc = q_desc[tiles_done % (unsigned int)PIPE_GENERATOR_QUEUE_DEPTH];
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+              PIPE_SPIN_INIT(lsa_tma_mbarrier_wait);
+              while (!staging_tma_mbarrier_try_wait(&tma_mbar[cur_desc.tile_buf],
+                                                    tma_consumer_phase[cur_desc.tile_buf])) {
+                PIPE_SYNC_TIMEOUT(lsa_tma_mbarrier_wait, params, trace_epoch, channel_id, source.peerWorldRank,
+                                  tiles_done, tma_consumer_phase[cur_desc.tile_buf],
+                                  *reinterpret_cast<volatile uint64_t*>(&tma_mbar[cur_desc.tile_buf]));
+              }
+              tma_consumer_phase[cur_desc.tile_buf] ^= 1;
+#else
               staging_tma_mbarrier_wait(&tma_mbar[cur_desc.tile_buf], tma_consumer_phase[cur_desc.tile_buf]);
+#endif
             }
             /* Publish the completed TMA tile descriptor to every unpack warp. */
             barrier_sync_subset(PIPE_GENERATOR_UNPACK_BARRIER_ID, PIPE_GENERATOR_UNPACK_THREADS);

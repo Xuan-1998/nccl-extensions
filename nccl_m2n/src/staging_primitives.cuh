@@ -113,6 +113,33 @@ __device__ __forceinline__ uint64_t ld_acquire(const uint64_t* ptr, bool isLocal
   }
 }
 
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+#ifndef STAGING_PIPE_SYNC_TIMEOUT_CYCLES
+#define STAGING_PIPE_SYNC_TIMEOUT_CYCLES 10000000000ULL
+#endif
+
+__device__ __forceinline__ void staging_pipe_sync_timeout(StagingKernelParams* params, uint64_t epoch, int channel_id,
+                                                          const char* label, int peer, size_t progress,
+                                                          uint64_t expected, uint64_t observed,
+                                                          unsigned long long elapsed) {
+  printf("[PIPE_SYNC_TIMEOUT] rank=%d local_rank=%d epoch=%llu ch=%d wait=%s peer=%d progress=%llu expected=%llu "
+         "observed=%llu elapsed_cycles=%llu\n",
+         params->myRank, params->myLocalRank, (unsigned long long)epoch, channel_id, label, peer,
+         (unsigned long long)progress, (unsigned long long)expected, (unsigned long long)observed, elapsed);
+  asm volatile("trap;");
+}
+
+__device__ __forceinline__ void staging_pipe_check_timeout(StagingKernelParams* params, uint64_t epoch,
+                                                           int channel_id, const char* label, int peer,
+                                                           size_t progress, uint64_t expected, uint64_t observed,
+                                                           unsigned long long start) {
+  const unsigned long long elapsed = clock64() - start;
+  if (elapsed > STAGING_PIPE_SYNC_TIMEOUT_CYCLES) {
+    staging_pipe_sync_timeout(params, epoch, channel_id, label, peer, progress, expected, observed, elapsed);
+  }
+}
+#endif
+
 // ============================================================================
 // Layer 2: Flow Control Primitives
 // ============================================================================
@@ -199,6 +226,62 @@ __device__ __forceinline__ void lsa_rdma_wait_for_credits(ncclGin& gin, StagingF
     // Back-pressure: ring buffer full, wait for DMA completion
   }
 }
+
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+/* Debug-only counterparts keep credit-wait instrumentation alongside the
+ * shared primitives. The normal build continues to call the compact loops
+ * above and does not reference the timeout machinery. */
+__device__ __forceinline__ void rdma_wait_for_credits_debug(ncclGin& gin, StagingRegion& region, StagingFlowCtrl& fc,
+                                                            StagingKernelParams* params, uint64_t epoch,
+                                                            int channel_id, const char* label, int peer,
+                                                            size_t progress) {
+  const unsigned long long start = clock64();
+  const uint64_t expected = fc.shadowTail - (uint64_t)fc.peerNumSlots + 1;
+  if (fc.isLocal) {
+    char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
+    uint64_t* local_head_ptr = (uint64_t*)(staging_base + fc.localHeadOffset);
+    uint64_t observed = ld_acquire_gpu(local_head_ptr);
+    while ((fc.shadowTail - observed) >= (uint64_t)fc.peerNumSlots) {
+      staging_pipe_check_timeout(params, epoch, channel_id, label, peer, progress, expected, observed, start);
+      observed = ld_acquire_gpu(local_head_ptr);
+    }
+  } else {
+    uint64_t observed = gin.readSignal(fc.localHeadSignal) - fc.headSignalBase;
+    while ((fc.shadowTail - observed) >= (uint64_t)fc.peerNumSlots) {
+      staging_pipe_check_timeout(params, epoch, channel_id, label, peer, progress, expected, observed, start);
+      observed = gin.readSignal(fc.localHeadSignal) - fc.headSignalBase;
+    }
+  }
+}
+
+__device__ __forceinline__ void lsa_wait_for_credits_debug(StagingRegion& region, StagingFlowCtrl& fc,
+                                                           StagingKernelParams* params, uint64_t epoch,
+                                                           int channel_id, const char* label, int peer,
+                                                           size_t progress) {
+  char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
+  uint64_t* local_head_ptr = (uint64_t*)(staging_base + fc.localHeadOffset);
+  const unsigned long long start = clock64();
+  const uint64_t expected = fc.shadowTail - (uint64_t)fc.peerNumSlots + 1;
+  uint64_t observed = ld_acquire(local_head_ptr, fc.isLocal) - fc.lsaHeadBase;
+  while ((fc.shadowTail - observed) >= (uint64_t)fc.peerNumSlots) {
+    staging_pipe_check_timeout(params, epoch, channel_id, label, peer, progress, expected, observed, start);
+    observed = ld_acquire(local_head_ptr, fc.isLocal) - fc.lsaHeadBase;
+  }
+}
+
+__device__ __forceinline__ void lsa_rdma_wait_for_credits_debug(ncclGin& gin, StagingFlowCtrl& fc,
+                                                                 uint64_t base_offset, StagingKernelParams* params,
+                                                                 uint64_t epoch, int channel_id, const char* label,
+                                                                 int peer, size_t progress) {
+  const unsigned long long start = clock64();
+  const uint64_t expected = fc.shadowTail - (uint64_t)fc.peerNumSlots + 1 - base_offset;
+  uint64_t observed = gin.readCounter(fc.localPutCounter);
+  while ((fc.shadowTail - observed - base_offset) >= (uint64_t)fc.peerNumSlots) {
+    staging_pipe_check_timeout(params, epoch, channel_id, label, peer, progress, expected, observed, start);
+    observed = gin.readCounter(fc.localPutCounter);
+  }
+}
+#endif
 
 __device__ __forceinline__ uint64_t staging_cursor_load(StagingRegion& region, size_t offset) {
   char* staging_base = (char*)ncclGetLocalPointer(region.window, 0);
@@ -876,8 +959,8 @@ __device__ __forceinline__ void staging_copy(StagingCopyMode mode, char* dst, co
 //
 // Pattern:
 //   1. staging_tma_mbarrier_init(mbar, 1)     — once per mbarrier
-//   2. staging_tma_load(smem, gmem, mbar, N)  — async global→shared
-//   3. staging_tma_mbarrier_expect(mbar, N)    — register expected bytes
+//   2. staging_tma_mbarrier_expect(mbar, N)    — register expected bytes
+//   3. staging_tma_load(smem, gmem, mbar, N)  — async global→shared
 //   4. staging_tma_mbarrier_wait(mbar, phase)  — block until load done
 //   5. staging_tma_store(smem, gmem, N)        — async shared→global
 //   6. staging_tma_store_wait<0>()             — block until store done
@@ -943,7 +1026,7 @@ __device__ __forceinline__ void staging_tma_load(void* smem_dst, const void* gme
 }
 
 // Register expected transaction bytes on the mbarrier.
-// Call after staging_tma_load to tell the mbarrier how many bytes to expect.
+// Call before staging_tma_load to register its expected transaction bytes.
 __device__ __forceinline__ void staging_tma_mbarrier_expect(uint64_t* mbar_ptr, int num_bytes) {
 #if STAGING_TMA_AVAILABLE
   uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
@@ -975,6 +1058,28 @@ __device__ __forceinline__ void staging_tma_mbarrier_wait(uint64_t* mbar_ptr, ui
   (void)phase;
 #endif
 }
+
+#ifdef STAGING_PIPE_SYNC_TIMEOUT_DEBUG
+__device__ __forceinline__ bool staging_tma_mbarrier_try_wait(uint64_t* mbar_ptr, uint32_t phase) {
+#if STAGING_TMA_AVAILABLE
+  uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+  uint32_t ready;
+  asm volatile("{\n\t"
+               ".reg .pred P1;\n\t"
+               "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2, %3;\n\t"
+               "selp.u32 %0, 1, 0, P1;\n\t"
+               "}\n"
+               : "=r"(ready)
+               : "r"(mbar_addr), "r"(phase), "r"(0x989680)
+               : "memory");
+  return ready != 0;
+#else
+  (void)mbar_ptr;
+  (void)phase;
+  return true;
+#endif
+}
+#endif
 
 // Async bulk store: shared memory → global memory.
 // Issues cp.async.bulk and commits the transaction group.

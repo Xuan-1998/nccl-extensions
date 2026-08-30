@@ -259,7 +259,7 @@ runEightRankDefaultMatrix() {
     return 1
   fi
 
-  local expectedCasesPerAlgorithm=141
+  local expectedCasesPerAlgorithm=142
   local ringPasses
   local directPasses
   local totalPasses

@@ -517,7 +517,7 @@ ncclResult_t buildStagingTransferDescriptor(
   ncclComm_t globalComm, void* srcBuffer, const size_t* srcTensorDims, int ndims, const ncclDistTensor_t* srcTensor,
   void* dstBuffer, const size_t* dstTensorDims, const ncclDistTensor_t* dstTensor, int srcGpusPerDomain,
   int dstGpusPerDomain, int nodeLocalRank, StagingTransferDescriptor* desc, bool splitStrided,
-  int splitNumInjectionDomains, int splitDomainsPerRep, bool nodeAnchorAtMeshStart) {
+  int splitNumInjectionDomains, int splitDomainsPerRep, bool nodeAnchorAtMeshStart, bool physicalLsaRanks) {
   if (!desc) {
     NCCL_M2N_FAIL(ncclInvalidArgument, -1, "buildStagingTransferDescriptor: output descriptor must be non-null");
   }
@@ -533,7 +533,6 @@ ncclResult_t buildStagingTransferDescriptor(
   bool isDest = reshardRankInMesh(dstMesh, worldRank);
 
   desc->myWorldRank = worldRank;
-  desc->myLocalRank = nodeLocalRank;
   desc->isSource = isSource;
   desc->isDest = isDest;
   desc->srcBuffer = srcBuffer;
@@ -590,7 +589,11 @@ ncclResult_t buildStagingTransferDescriptor(
     }
     return rank / dstGpd;
   };
+  const int lsaStartRank = worldRank - nodeLocalRank;
   auto rankLocal = [&](int rank) -> int {
+    if (physicalLsaRanks) {
+      return rank - lsaStartRank;
+    }
     if (rank >= dstStart && rank < dstEnd) {
       return (rank - dstStart) % dstGpd;
     }

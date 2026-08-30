@@ -163,7 +163,7 @@ struct StagingTransferPlan {
 struct StagingPeerInfo {
   int peerWorldRank;
   int peerShardIdx;
-  int peerLocalRank; /* node-local rank for LSA peers, -1 for RDMA */
+  int peerLocalRank; /* physical LSA rank for LSA peers, -1 for RDMA */
   int rdmaTransport;  /* STAGING_RDMA_TRANSPORT_*; only meaningful for RDMA peers. */
 
   StagingFlowCtrl fc;
@@ -180,6 +180,8 @@ struct StagingPeerInfo {
   /* Compact per-channel work range.  This lets control/signal paths avoid
    * touching the full tensor transfer plan unless they actually copy data. */
   size_t totalBytes;
+  /* Producer/consumer chunk contract for this edge. */
+  size_t logicalChunkSize;
   size_t chunkStart;
   size_t chunkEnd;
 };
@@ -294,6 +296,8 @@ struct StagingPipePeerEdge {
   bool active;
 
   size_t totalBytes;
+  /* Copied from StagingPeerInfo; used by both PIPE execution paths. */
+  size_t logicalChunkSize;
   int channelRank;
   int channelCount;
   size_t chunkStart;

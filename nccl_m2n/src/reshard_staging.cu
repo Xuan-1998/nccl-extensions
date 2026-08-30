@@ -118,9 +118,11 @@ static ReshardStagingTensorSignature stagingProcessTensorSignature(const ncclDis
   return signature;
 }
 
-static ReshardStagingChannelSignature stagingProcessChannelSignature(int activeChannelCount) {
-  ReshardStagingChannelSignature signature{};
-  signature.activeChannelCount = activeChannelCount;
+static ReshardStagingPipeSignature stagingProcessPipeSignature(const ReshardStagingMeshSignature& meshSignature,
+                                                               const ReshardStagingTensorSignature& tensorSignature) {
+  ReshardStagingPipeSignature signature{};
+  signature.meshSignature = meshSignature;
+  signature.tensorSignature = tensorSignature;
   return signature;
 }
 
@@ -475,6 +477,7 @@ static void stagingMakePipePeerEdge(const StagingPeerInfo* peer, int copyLayoutI
   edge->copyLayoutIndex = copyLayoutIndex;
   edge->active = peer->active && peer->channelCount > 0;
   edge->totalBytes = peer->totalBytes;
+  edge->logicalChunkSize = peer->logicalChunkSize;
   edge->channelRank = peer->channelRank;
   edge->channelCount = peer->channelCount;
   edge->chunkStart = peer->chunkStart;
@@ -534,34 +537,25 @@ static ncclResult_t stagingEnsurePipeHostPlanEntryStorage(StagingPipePlanCacheEn
   return ncclSuccess;
 }
 
-static bool stagingPlanMatches(const StagingPipePlanCacheEntry& entry, const ReshardStagingMeshSignature& meshSignature,
-                               const ReshardStagingChannelSignature& channelSignature,
-                               const ReshardStagingTensorSignature& tensorSignature) {
-  return entry.hostValid && entry.meshSignature == meshSignature && entry.channelSignature == channelSignature &&
-         entry.tensorSignature == tensorSignature;
+static bool stagingPlanMatches(const StagingPipePlanCacheEntry& entry, const ReshardStagingPipeSignature& signature) {
+  return entry.hostValid && entry.signature == signature;
 }
 
 static void stagingInvalidatePipePlanEntry(StagingPipePlanCacheEntry* entry,
-                                           const ReshardStagingMeshSignature& meshSignature,
-                                           const ReshardStagingChannelSignature& channelSignature,
-                                           const ReshardStagingTensorSignature& tensorSignature) {
-  entry->meshSignature = meshSignature;
-  entry->channelSignature = channelSignature;
-  entry->tensorSignature = tensorSignature;
+                                           const ReshardStagingPipeSignature& signature) {
+  entry->signature = signature;
   entry->hostValid = false;
   entry->deviceValid = false;
 }
 
 static ncclResult_t stagingGetPipePlanEntry(StagingBufferState* staging,
-                                            const ReshardStagingMeshSignature& meshSignature,
-                                            const ReshardStagingChannelSignature& channelSignature,
-                                            const ReshardStagingTensorSignature& tensorSignature, int preferredSlot,
-                                            int rank, StagingPipePlanCacheEntry** outEntry, bool* cacheMiss) {
+                                            const ReshardStagingPipeSignature& signature, int preferredSlot, int rank,
+                                            StagingPipePlanCacheEntry** outEntry, bool* cacheMiss) {
   NCCL_M2N_CHECK_ARG(staging != nullptr && outEntry != nullptr && cacheMiss != nullptr, rank,
                      "[STAGING] PIPE plan cache lookup requires staging, entry, and miss outputs");
   for (int i = 0; i < STAGING_PIPE_CONTROL_SLOTS; i++) {
     StagingPipePlanCacheEntry& entry = staging->pipePlanCache[i];
-    if (stagingPlanMatches(entry, meshSignature, channelSignature, tensorSignature)) {
+    if (stagingPlanMatches(entry, signature)) {
       *outEntry = &entry;
       *cacheMiss = false;
       return ncclSuccess;
@@ -588,16 +582,14 @@ static ncclResult_t stagingGetPipePlanEntry(StagingBufferState* staging,
 
   StagingPipePlanCacheEntry& entry = staging->pipePlanCache[slot];
   NCCL_M2N_CHECK(stagingEnsurePipeHostPlanEntryStorage(&entry, rank));
-  stagingInvalidatePipePlanEntry(&entry, meshSignature, channelSignature, tensorSignature);
+  stagingInvalidatePipePlanEntry(&entry, signature);
   *outEntry = &entry;
   *cacheMiss = true;
   return ncclSuccess;
 }
 
 static ncclResult_t stagingFinalizePipeHostPlan(StagingPipePlanCacheEntry* entry,
-                                                const ReshardStagingMeshSignature& meshSignature,
-                                                const ReshardStagingChannelSignature& channelSignature,
-                                                const ReshardStagingTensorSignature& tensorSignature, int rank) {
+                                                const ReshardStagingPipeSignature& signature, int rank) {
   NCCL_M2N_CHECK_ARG(entry != nullptr && entry->hostParams != nullptr && entry->hostPlan != nullptr, rank,
                      "[STAGING] cannot finalize missing PIPE host plan");
 
@@ -606,25 +598,19 @@ static ncclResult_t stagingFinalizePipeHostPlan(StagingPipePlanCacheEntry* entry
    * small by-value StagingPipeCallParams. */
   stagingBuildPipeDevicePlan(entry->hostParams, entry->hostPlan);
   stagingNormalizePipeStaticPlan(entry->hostParams);
-  entry->meshSignature = meshSignature;
-  entry->channelSignature = channelSignature;
-  entry->tensorSignature = tensorSignature;
+  entry->signature = signature;
   entry->hostValid = true;
   entry->deviceValid = false;
   return ncclSuccess;
 }
 
 static ncclResult_t stagingEnsurePipeDevicePlan(StagingPipePlanCacheEntry* entry,
-                                                const ReshardStagingMeshSignature& meshSignature,
-                                                const ReshardStagingChannelSignature& channelSignature,
-                                                const ReshardStagingTensorSignature& tensorSignature,
-                                                cudaStream_t stream, int rank) {
+                                                const ReshardStagingPipeSignature& signature, cudaStream_t stream,
+                                                int rank) {
   NCCL_M2N_CHECK_ARG(entry != nullptr && entry->hostParams != nullptr && entry->hostPlan != nullptr &&
-                       entry->hostValid && entry->meshSignature == meshSignature &&
-                       entry->channelSignature == channelSignature && entry->tensorSignature == tensorSignature,
+                       entry->hostValid && entry->signature == signature,
                      rank, "[STAGING] cannot upload missing PIPE device plan");
-  if (entry->deviceValid && entry->meshSignature == meshSignature && entry->channelSignature == channelSignature &&
-      entry->tensorSignature == tensorSignature) {
+  if (entry->deviceValid && entry->signature == signature) {
     return ncclSuccess;
   }
 
@@ -1416,9 +1402,10 @@ extern "C" void stagingPipeHostRmaPipelineDestroy(void* pipeline) {
   delete static_cast<PipeHostPipeline*>(pipeline);
 }
 
-static ncclResult_t pipeHostChunkInfo(const StagingPipePeerEdge& edge, size_t chunkSize, size_t globalChunk, int rank,
-                                      size_t* byteStart, size_t* bytes) {
+static ncclResult_t pipeHostChunkInfo(const StagingPipePeerEdge& edge, size_t globalChunk, int rank, size_t* byteStart,
+                                      size_t* bytes) {
   NCCL_M2N_CHECK_ARG(byteStart != nullptr && bytes != nullptr, rank, "PIPE host_rma: null chunk info output");
+  const size_t chunkSize = edge.logicalChunkSize;
   NCCL_M2N_CHECK_ARG(chunkSize > 0, rank, "PIPE host_rma: invalid chunk size 0");
   size_t start = 0;
   NCCL_M2N_CHECK_ARG(m2nCheckedMulSize(globalChunk, chunkSize, &start), rank,
@@ -1535,12 +1522,14 @@ static ncclResult_t pipeHostChunkTileRange(const StagingPipePeerEdge& edge, cons
 }
 
 static ncclResult_t pipeHostChunkForRound(const StagingPipePeerEdge& edge, const StagingPipeCopyLayout& layout,
-                                          size_t chunkSize, size_t round, int rank, PipeHostChunk* chunk) {
+                                          size_t round, int rank, PipeHostChunk* chunk) {
   NCCL_M2N_CHECK_ARG(chunk != nullptr, rank, "PIPE host_rma: null chunk output");
   *chunk = {};
   if (!pipeHostEdgeActive(edge)) {
     return ncclSuccess;
   }
+  const size_t chunkSize = edge.logicalChunkSize;
+  NCCL_M2N_CHECK_ARG(chunkSize > 0, rank, "PIPE host_rma: invalid edge chunk size 0");
 
   PipeHostChunkGeometry geometry;
   if (pipeHostBuildChunkGeometry(edge, layout, chunkSize, &geometry)) {
@@ -1593,18 +1582,20 @@ static ncclResult_t pipeHostChunkForRound(const StagingPipePeerEdge& edge, const
   if (globalChunk >= edge.chunkEnd) {
     return ncclSuccess;
   }
-  NCCL_M2N_CHECK(pipeHostChunkInfo(edge, chunkSize, globalChunk, rank, &chunk->byteStart, &chunk->bytes));
+  NCCL_M2N_CHECK(pipeHostChunkInfo(edge, globalChunk, rank, &chunk->byteStart, &chunk->bytes));
   chunk->active = true;
   return ncclSuccess;
 }
 
 static ncclResult_t pipeHostChunkCountForEdge(const StagingPipePeerEdge& edge, const StagingPipeCopyLayout& layout,
-                                              size_t chunkSize, int rank, size_t* count) {
+                                              int rank, size_t* count) {
   NCCL_M2N_CHECK_ARG(count != nullptr, rank, "PIPE host_rma: null chunk count output");
   *count = 0;
   if (!pipeHostEdgeActive(edge)) {
     return ncclSuccess;
   }
+  const size_t chunkSize = edge.logicalChunkSize;
+  NCCL_M2N_CHECK_ARG(chunkSize > 0, rank, "PIPE host_rma: invalid edge chunk size 0");
   PipeHostChunkGeometry geometry;
   if (pipeHostBuildChunkGeometry(edge, layout, chunkSize, &geometry)) {
     size_t tileStart = 0;
@@ -1624,7 +1615,7 @@ static ncclResult_t pipeHostPlanMaxChunkRounds(const StagingKernelParams* params
   *rounds = 0;
   auto update = [&](const StagingPipePeerEdge& edge, const StagingPipeCopyLayout& layout) {
     size_t edgeRounds = 0;
-    ncclResult_t result = pipeHostChunkCountForEdge(edge, layout, params->chunkSize, rank, &edgeRounds);
+    ncclResult_t result = pipeHostChunkCountForEdge(edge, layout, rank, &edgeRounds);
     if (result == ncclSuccess) {
       *rounds = std::max(*rounds, edgeRounds);
     }
@@ -1915,7 +1906,6 @@ static ncclResult_t pipeHostPhasedSourcePacks(const StagingKernelParams* params,
     return ncclSuccess;
   }
   NCCL_M2N_CHECK_ARG(call->srcBuffer != nullptr, params->myRank, "PIPE host_rma: source rank has null srcBuffer");
-  const size_t chunkSize = params->chunkSize;
   const int targetEnd = pipeHostTrainerTargetEnd(params);
   const int firstChannel = onlyChannel < 0 ? 0 : onlyChannel;
   const int lastChannel = onlyChannel < 0 ? params->numChannels : onlyChannel + 1;
@@ -1926,8 +1916,8 @@ static ncclResult_t pipeHostPhasedSourcePacks(const StagingKernelParams* params,
       const StagingPipeTrainerEdge& trainerEdge = plan->rdmaTargets[ch][t];
       const StagingPipePeerEdge& target = trainerEdge.peer;
       PipeHostChunk chunk;
-      NCCL_M2N_CHECK(pipeHostChunkForRound(target, plan->rdmaTargetLayouts[ch][target.copyLayoutIndex], chunkSize,
-                                           round, params->myRank, &chunk));
+      NCCL_M2N_CHECK(pipeHostChunkForRound(target, plan->rdmaTargetLayouts[ch][target.copyLayoutIndex], round,
+                                           params->myRank, &chunk));
       if (!chunk.active) {
         continue;
       }
@@ -1963,7 +1953,6 @@ static ncclResult_t pipeHostPhasedSourcePuts(const StagingKernelParams* params, 
   if (hostComm == nullptr) {
     return ncclSuccess;
   }
-  const size_t chunkSize = params->chunkSize;
   const int targetEnd = pipeHostTrainerTargetEnd(params);
   const int firstChannel = onlyChannel < 0 ? 0 : onlyChannel;
   const int lastChannel = onlyChannel < 0 ? params->numChannels : onlyChannel + 1;
@@ -1977,8 +1966,8 @@ static ncclResult_t pipeHostPhasedSourcePuts(const StagingKernelParams* params, 
         continue;
       }
       PipeHostChunk chunk;
-      NCCL_M2N_CHECK(pipeHostChunkForRound(target, plan->rdmaTargetLayouts[ch][target.copyLayoutIndex], chunkSize,
-                                           round, params->myRank, &chunk));
+      NCCL_M2N_CHECK(pipeHostChunkForRound(target, plan->rdmaTargetLayouts[ch][target.copyLayoutIndex], round,
+                                           params->myRank, &chunk));
       if (!chunk.active) {
         continue;
       }
@@ -2021,8 +2010,8 @@ static ncclResult_t pipeHostSourceCreditActive(const StagingKernelParams* params
   }
   const StagingPipePeerEdge& target = plan->rdmaTargets[channel][targetIndex].peer;
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(target, plan->rdmaTargetLayouts[channel][target.copyLayoutIndex],
-                                       params->chunkSize, round, params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(target, plan->rdmaTargetLayouts[channel][target.copyLayoutIndex], round,
+                                       params->myRank, &chunk));
   if (!chunk.active) {
     return ncclSuccess;
   }
@@ -2057,8 +2046,8 @@ static ncclResult_t pipeHostPhasedDestSourceWait(const StagingKernelParams* para
     return ncclSuccess;
   }
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], params->chunkSize, round,
-                                       params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &chunk));
   if (chunk.active) {
     NCCL_M2N_CHECK(pipeHostWaitListAdd(waits, source.peerWorldRank, 0, 0, 1, params->myRank));
   }
@@ -2074,8 +2063,8 @@ static ncclResult_t pipeHostPhasedDestRootCopy(const StagingKernelParams* params
   }
   const StagingPipePeerEdge& source = plan->rdmaSources[channel][sourceIndex];
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], params->chunkSize, round,
-                                       params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &chunk));
   if (!chunk.active) {
     return ncclSuccess;
   }
@@ -2101,12 +2090,11 @@ static ncclResult_t pipeHostPhasedRingForward(const StagingKernelParams* params,
   if (hostComm == nullptr) {
     return ncclSuccess;
   }
-  const size_t chunkSize = params->chunkSize;
   const int ringStart = pipeHostRingTargetStart(params);
   const StagingPipePeerEdge& source = plan->rdmaSources[channel][sourceIndex];
   PipeHostChunk sourceChunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], chunkSize, round,
-                                       params->myRank, &sourceChunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &sourceChunk));
   if (!sourceChunk.active) {
     return ncclSuccess;
   }
@@ -2120,8 +2108,8 @@ static ncclResult_t pipeHostPhasedRingForward(const StagingKernelParams* params,
     return ncclSuccess;
   }
   PipeHostChunk targetChunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(target, plan->rdmaTargetLayouts[channel][target.copyLayoutIndex], chunkSize,
-                                       round, params->myRank, &targetChunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(target, plan->rdmaTargetLayouts[channel][target.copyLayoutIndex], round,
+                                       params->myRank, &targetChunk));
   NCCL_M2N_CHECK_ARG(targetChunk.active && targetChunk.byteStart == sourceChunk.byteStart &&
                        targetChunk.bytes == sourceChunk.bytes,
                      params->myRank,
@@ -2166,8 +2154,8 @@ static ncclResult_t pipeHostPhasedRootSignalFollowers(const StagingKernelParams*
   }
   const StagingPipePeerEdge& source = plan->rdmaSources[channel][sourceIndex];
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], params->chunkSize, round,
-                                       params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &chunk));
   if (!chunk.active) {
     return ncclSuccess;
   }
@@ -2198,8 +2186,8 @@ static ncclResult_t pipeHostPhasedFollowerWaitRoot(const StagingKernelParams* pa
     return ncclSuccess;
   }
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->lsaSourceLayouts[channel][sourceIndex], params->chunkSize, round,
-                                       params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->lsaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &chunk));
   if (chunk.active) {
     NCCL_M2N_CHECK(pipeHostWaitListAdd(waits, source.peerWorldRank, 0, 0, 1, params->myRank));
   }
@@ -2217,8 +2205,8 @@ static ncclResult_t pipeHostPhasedFollowerDirectCopy(const StagingKernelParams* 
   NCCL_M2N_CHECK_ARG(params->lsaWindow != nullptr, params->myRank, "PIPE host_rma: LSA window is null");
   const StagingPipePeerEdge& source = plan->lsaSources[channel][sourceIndex];
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->lsaSourceLayouts[channel][sourceIndex], params->chunkSize, round,
-                                       params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->lsaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &chunk));
   if (!chunk.active) {
     return ncclSuccess;
   }
@@ -2249,8 +2237,8 @@ static ncclResult_t pipeHostPhasedFollowerDoneSignals(const StagingKernelParams*
     return ncclSuccess;
   }
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->lsaSourceLayouts[channel][sourceIndex], params->chunkSize, round,
-                                       params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->lsaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &chunk));
   if (chunk.active) {
     NCCL_M2N_CHECK(pipeHostSignal(hostComm->comm, source.peerWorldRank, stream, params->myRank,
                                   "follower.signal_root"));
@@ -2268,8 +2256,8 @@ static ncclResult_t pipeHostPhasedRootFollowerWaits(const StagingKernelParams* p
   }
   const StagingPipePeerEdge& source = plan->rdmaSources[channel][sourceIndex];
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], params->chunkSize, round,
-                                       params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &chunk));
   if (!chunk.active) {
     return ncclSuccess;
   }
@@ -2304,8 +2292,8 @@ static ncclResult_t pipeHostPhasedDestCreditSignals(const StagingKernelParams* p
     return ncclSuccess;
   }
   PipeHostChunk chunk;
-  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], params->chunkSize, round,
-                                       params->myRank, &chunk));
+  NCCL_M2N_CHECK(pipeHostChunkForRound(source, plan->rdmaSourceLayouts[channel][sourceIndex], round, params->myRank,
+                                       &chunk));
   if (chunk.active) {
     NCCL_M2N_CHECK(pipeHostSignal(hostComm->comm, source.peerWorldRank, stream, params->myRank,
                                   "root.signal_source_credit"));
@@ -2685,7 +2673,8 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   const ReshardCopyAlgorithm copyAlgo = reshardGetCopyAlgorithm();
   int parentCommSize = 0;
   NCCL_M2N_CHECK(ncclCommCount(comm, &parentCommSize));
-  reshardResolveAdaptiveScaleConfig(parentCommSize, copyAlgo == RESHARD_COPY_ALGO_PACK);
+  const bool pipeSplitCandidate = copyAlgo == RESHARD_COPY_ALGO_PIPE && tensorRepCount(dstTensor) > 1;
+  reshardResolveAdaptiveScaleConfig(parentCommSize, copyAlgo == RESHARD_COPY_ALGO_PACK || pipeSplitCandidate);
 
   int world_rank = 0, world_size = 0;
   NCCL_M2N_CHECK(ncclCommUserRank(comm, &world_rank));
@@ -2823,7 +2812,8 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       NCCL_M2N_CHECK(buildStagingTransferDescriptor(comm, srcBuffer, src_dims_bytes, ndims, srcTensor, dstBuffer,
                                                     dst_dims_bytes, dstTensor, src_gpus_per_domain, dst_gpus_per_domain,
                                                     node_local_rank, outDesc, splitStrided, splitNumInjectionDomains,
-                                                    splitDomainsPerRep, nodeAnchorAtMeshStart));
+                                                    splitDomainsPerRep, nodeAnchorAtMeshStart,
+                                                    copyAlgo == RESHARD_COPY_ALGO_PIPE));
     }
     return ncclSuccess;
   };
@@ -2889,15 +2879,15 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     srcTensor, dstTensor, src_gpus_per_domain, dst_gpus_per_domain, splitStagingActive && splitComms.strided,
     splitStagingActive ? splitComms.numInjectionDomains : 0, splitStagingActive ? splitComms.domainsPerRep : 0);
   const ReshardStagingTensorSignature stagingTensorSignature = stagingProcessTensorSignature(srcTensor, dstTensor);
-  const ReshardStagingChannelSignature stagingChannelSignature =
-    stagingProcessChannelSignature(requestedStagingNumCtas);
+  const ReshardStagingPipeSignature stagingPipeSignature =
+    stagingProcessPipeSignature(stagingMeshSignature, stagingTensorSignature);
   const int stagingControlSlotCount =
     (copyAlgo == RESHARD_COPY_ALGO_PIPE) ? STAGING_PIPE_CONTROL_SLOTS : STAGING_DEFAULT_CONTROL_SLOTS;
   int persistentControlSlot = 0;
   bool persistentControlSlotValid = false;
   if (copyAlgo == RESHARD_COPY_ALGO_PIPE) {
-    NCCL_M2N_CHECK(reshardGetOrCreatePersistentControlSlot(comm, stagingMeshSignature, stagingChannelSignature,
-                                                           world_rank, &persistentControlSlot));
+    NCCL_M2N_CHECK(reshardGetOrCreatePersistentControlSlot(comm, stagingPipeSignature, world_rank,
+                                                           &persistentControlSlot));
     NCCL_M2N_CHECK_ARG(persistentControlSlot >= 0 && persistentControlSlot < stagingControlSlotCount, world_rank,
                        "PIPE persistent control slot %d exceeds control slot count %d", persistentControlSlot,
                        stagingControlSlotCount);
@@ -2960,25 +2950,11 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
   {
     StagingProfileScope profileScope(profile.get(), STAGING_PROFILE_PREPARE_PARAMS);
     if (copyAlgo == RESHARD_COPY_ALGO_PIPE) {
-      NCCL_M2N_CHECK(stagingGetPipePlanEntry(staging, stagingMeshSignature, stagingChannelSignature,
-                                             stagingTensorSignature, persistentControlSlot, world_rank, &pipePlanEntry,
-                                             &pipePlanCacheMiss));
+      NCCL_M2N_CHECK(stagingGetPipePlanEntry(staging, stagingPipeSignature, persistentControlSlot, world_rank,
+                                             &pipePlanEntry, &pipePlanCacheMiss));
       if (pipePlanCacheMiss) {
         NCCL_M2N_CHECK(stagingPrepareTransfer(staging, &desc, staging_window, staging_window,
                                               pipePlanEntry->hostParams));
-
-        if (pipePlanEntry->hostParams->numLsaSources > 0) {
-          size_t offsetDiff =
-            pipePlanEntry->hostParams->lsaRegions[0].dataOffset - pipePlanEntry->hostParams->rdmaRegions[0].dataOffset;
-          for (int ch = 0; ch < pipePlanEntry->hostParams->numChannels; ch++) {
-            for (int s = 0; s < pipePlanEntry->hostParams->numLsaSources; s++) {
-              if (!pipePlanEntry->hostParams->lsaSources[ch][s].active) {
-                continue;
-              }
-              pipePlanEntry->hostParams->lsaSources[ch][s].fc.peerDataOffset -= offsetDiff;
-            }
-          }
-        }
       }
       pipeLaunchParams = pipePlanEntry->hostParams;
       pipeCall.srcBuffer = srcBuffer;
@@ -3091,9 +3067,9 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       ncclDevComm* outSplitDevCommB = pipeHostRma ? nullptr : &splitDevCommB;
       ReshardDevCommUse* outSplitDevCommBUse = pipeHostRma ? nullptr : &splitDevCommBUse;
       NCCL_M2N_CHECK(reshardSplitEnsureResources(
-        &splitComms, staging->buffer, staging->totalSize, resourceStagingChannels, ginSignalCountA, ginCounterCountA,
-        signalsPerSlotB, countersPerSlotB, ctxPerSlotB, maxConcurrency, workStream, &windowA, &windowB,
-        outSplitDevCommA, outSplitDevCommAUse, outSplitDevCommB, outSplitDevCommBUse));
+        &splitComms, staging->buffer, staging->totalSize, 0, RESHARD_DEVCOMM_BARRIER_NONE, ginSignalCountA,
+        ginCounterCountA, signalsPerSlotB, countersPerSlotB, ctxPerSlotB, maxConcurrency, workStream, &windowA,
+        &windowB, outSplitDevCommA, outSplitDevCommAUse, outSplitDevCommB, outSplitDevCommBUse));
       if (pipePlanCacheMiss) {
         NCCL_M2N_CHECK(applySplitPipeParams(pipePlanEntry->hostParams, &splitComms, windowA, windowB,
                                             signalsPerControlSlot, countersPerControlSlot, signalsPerSlotB,
@@ -3117,8 +3093,8 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
       const int totalGinSignalCount = resourceGinSignalCount * persistentControlSlots;
       const int totalGinCounterCount = resourceGinCounterCount * persistentControlSlots;
       if (!pipeHostRma) {
-        NCCL_M2N_CHECK(reshardGetOrCreateDevComm(comm, resourceStagingChannels, totalGinSignalCount,
-                                                 totalGinCounterCount, RESHARD_DEVCOMM_BARRIER_WORLD,
+        NCCL_M2N_CHECK(reshardGetOrCreateDevComm(comm, 0, totalGinSignalCount,
+                                                 totalGinCounterCount, RESHARD_DEVCOMM_BARRIER_NONE,
                                                  stagingGinContextCount, workStream, &activeDevComm, &devCommUse));
         devCommPtr = &activeDevComm;
       }
@@ -3134,8 +3110,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
     }
 
     if (copyAlgo == RESHARD_COPY_ALGO_PIPE && pipePlanCacheMiss) {
-      NCCL_M2N_CHECK(stagingFinalizePipeHostPlan(pipePlanEntry, stagingMeshSignature, stagingChannelSignature,
-                                                 stagingTensorSignature, world_rank));
+      NCCL_M2N_CHECK(stagingFinalizePipeHostPlan(pipePlanEntry, stagingPipeSignature, world_rank));
       pipeLaunchParams = pipePlanEntry->hostParams;
     }
   }
@@ -3163,8 +3138,7 @@ extern "C" ncclResult_t ncclReshard(ncclM2nHandle_t handle, ncclComm_t comm, con
 
   ncclResult_t launchResult = ncclSuccess;
   auto launchPipe = [&](bool splitLaunch) -> ncclResult_t {
-    ncclResult_t result = stagingEnsurePipeDevicePlan(pipePlanEntry, stagingMeshSignature, stagingChannelSignature,
-                                                      stagingTensorSignature, workStream, world_rank);
+    ncclResult_t result = stagingEnsurePipeDevicePlan(pipePlanEntry, stagingPipeSignature, workStream, world_rank);
     if (result == ncclSuccess) {
       if (splitLaunch) {
         result = launchStagingReshardPipeSplit(pipeLaunchParams, &pipeCall, pipePlanEntry->devParams,

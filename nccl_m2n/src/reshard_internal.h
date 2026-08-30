@@ -209,7 +209,7 @@ inline bool gReshardUseInternalStreams = true;
 inline size_t gReshardChunkSizeBytes = 0;
 
 /* Enables the split-comm (commA FULL + commB RAIL) RING path for QP
- * scalability. Takes effect for PACK RING + NODE_AWARE. Parsed once
+ * scalability. Takes effect for split-capable RING + NODE_AWARE paths. Parsed once
  * from NCCL_RESHARD_SPLIT_COMM at first init. Default on for that path. */
 inline bool gReshardSplitComm = true;
 
@@ -412,7 +412,8 @@ inline size_t pickElementsPerChunk(size_t bytesPerRank, ReshardAlgorithm algo) {
  * reshard_cache.cc — DevComm and Window caches
  * ====================================================================*/
 
-enum ReshardDevCommBarrierKind {
+enum ReshardDevCommBarrierKind : int {
+  RESHARD_DEVCOMM_BARRIER_NONE,
   RESHARD_DEVCOMM_BARRIER_HYBRID,
   RESHARD_DEVCOMM_BARRIER_WORLD,
 };
@@ -820,7 +821,7 @@ ncclResult_t buildStagingTransferDescriptor(ncclComm_t globalComm, void* srcBuff
                                             int srcGpusPerDomain, int dstGpusPerDomain, int nodeLocalRank,
                                             StagingTransferDescriptor* desc, bool splitStrided = false,
                                             int splitNumInjectionDomains = 0, int splitDomainsPerRep = 1,
-                                            bool nodeAnchorAtMeshStart = false);
+                                            bool nodeAnchorAtMeshStart = false, bool physicalLsaRanks = false);
 
 ncclResult_t buildStagingDirectTransferDescriptor(ncclComm_t globalComm, void* srcBuffer, const size_t* srcTensorDims,
                                                   int ndims, const ncclDistTensor_t* srcTensor, void* dstBuffer,
