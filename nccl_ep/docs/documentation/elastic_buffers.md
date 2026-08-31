@@ -13,7 +13,7 @@ NCCL_EP_HT_EM_LOCAL_DUP=false    # (default)
 NCCL_EP_HT_EM_NVLINK_DUP=false   # (default)
 ```
 
-In this configuration the receiver expands the FLAT staging buffer into the user's
+In this configuration the receiver expands the flat staging buffer into the user's
 recv buffer with a **permute kernel** (SASS stores) and combine reads it back with
 a reduce kernel — so the recv buffer is filled and read purely by kernel
 loads/stores. The Expert-Major layout with both dup modes off is required because:
