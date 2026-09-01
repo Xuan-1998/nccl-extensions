@@ -124,6 +124,7 @@ struct TestCase {
   bool bGraphCapturePrewarmed;
   bool bNullWindow; /* pass NULL to ncclReshardWithWindow */
   int serialRepeats; /* reshard calls with a stream sync and validation after each call */
+  const char* requiredCopyAlgorithm; /* nullptr = any copy algorithm */
 };
 
 static inline void printTo(const TestCase& tc, std::ostream* os) {
@@ -567,6 +568,7 @@ static void emitPipeLsaFanoutReuse(std::vector<TestCase>& cases) {
   tc.worldMax = 8;
   tc.worldDivisor = 8;
   tc.serialRepeats = 8;
+  tc.requiredCopyAlgorithm = "PIPE";
   tc.name = buildCaseName(tc);
   cases.push_back(std::move(tc));
 }
@@ -1227,10 +1229,31 @@ static bool caseMatchesSelection(const TestCase& tc, const char* filter, int min
   return true;
 }
 
+static const char* basicApiSelectedCopyAlgorithm(const BasicApiCliArgs& cli) {
+  if (cli.copyAlgorithm != nullptr) {
+    if (strcmp(cli.copyAlgorithm, "direct") == 0) return "DIRECT";
+    if (strcmp(cli.copyAlgorithm, "pipe") == 0) return "PIPE";
+    return "PACK";
+  }
+
+  // NOLINTNEXTLINE(concurrency-mt-unsafe) — test selection runs before worker threads start
+  const char* copyAlgorithmEnv = getenv("NCCL_RESHARD_COPY_ALGORITHM");
+  if (copyAlgorithmEnv != nullptr) {
+    if (strcasecmp(copyAlgorithmEnv, "DIRECT") == 0) return "DIRECT";
+    if (strcasecmp(copyAlgorithmEnv, "PIPE") == 0) return "PIPE";
+    return "PACK";
+  }
+  return strcmp(cli.algorithm, "direct") == 0 ? "DIRECT" : "PACK";
+}
+
 static std::vector<TestCase> basicApiSelectCases(const std::vector<TestCase>& cases, const BasicApiCliArgs& cli) {
   std::vector<TestCase> selected;
+  const char* copyAlgorithm = basicApiSelectedCopyAlgorithm(cli);
   for (const TestCase& tc : cases) {
     if (!caseMatchesSelection(tc, cli.filter, cli.minWorld, cli.maxWorld)) {
+      continue;
+    }
+    if (tc.requiredCopyAlgorithm != nullptr && strcasecmp(tc.requiredCopyAlgorithm, copyAlgorithm) != 0) {
       continue;
     }
     TestCase selectedCase = tc;
@@ -1454,7 +1477,7 @@ static CaseResult runOneCase(const TestCase& tc, TestEnv* env) {
    * issues a grouped pair through the selected entry point. The window entry
    * point is a compatibility alias for the default one, so it must fuse the
    * same way -- that is what this MR claims, so both kinds run the scenario. */
-  const bool testPackFusion = env->expectPack && !asyncOrdering;
+  const bool testPackFusion = env->expectPack && !asyncOrdering && tc.serialRepeats <= 1;
 #else
   const bool testPackFusion = false;
 #endif

@@ -259,7 +259,7 @@ runEightRankDefaultMatrix() {
     return 1
   fi
 
-  local expectedCasesPerAlgorithm=142
+  local expectedCasesPerAlgorithm=141
   local ringPasses
   local directPasses
   local totalPasses
@@ -277,6 +277,10 @@ runEightRankDefaultMatrix() {
     return 1
   fi
   rm -f "${log}"
+
+  runCase "PIPE LSA fanout reuse" \
+    --filter pipe_lsa_fanout_reuse --algorithm ring --api window --copy-algorithm pipe \
+    --gtest_filter='Matrix/BasicApiMpiTest.*'
 }
 
 runBenchmark() {

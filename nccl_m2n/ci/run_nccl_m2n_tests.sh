@@ -39,6 +39,25 @@ trap 'rm -f "${log}"' EXIT
 
 "${binary}" -N "${numGpus}" 2>&1 | tee "${log}"
 
+if (( numGpus >= 8 )); then
+  pipeLog="$(mktemp)"
+  trap 'rm -f "${log}" "${pipeLog}"' EXIT
+  if ! "${binary}" -N 8 --filter pipe_lsa_fanout_reuse --algorithm ring --api window --copy-algorithm pipe \
+    >"${pipeLog}" 2>&1; then
+    cat "${pipeLog}"
+    exit 1
+  fi
+  cat "${pipeLog}"
+  if ! grep -Eq '^worldSize=8, devices=[1-9][0-9]*,' "${pipeLog}"; then
+    echo "PIPE fanout reuse run did not execute with 8 local ranks." >&2
+    exit 1
+  fi
+  if ! grep -Eq '^\[       OK \] Matrix/BasicApiLocalTest.Reshard/.*pipe_lsa_fanout_reuse' "${pipeLog}"; then
+    echo "PIPE fanout reuse run did not complete its matrix case." >&2
+    exit 1
+  fi
+fi
+
 if ! grep -Eq "^worldSize=${numGpus}, devices=[1-9][0-9]*," "${log}"; then
   echo "basic_api_test_local did not run with ${numGpus} local ranks." >&2
   exit 1
