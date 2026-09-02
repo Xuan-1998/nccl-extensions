@@ -750,6 +750,7 @@ struct ncclEpGroup {
         // RDMA sync-guard readiness-flag regions (per direction)
         size_t dispatch_guard_offset = 0;
         size_t combine_guard_offset = 0;
+        size_t combine_header_offset = 0; // unordered-fabric combine headers (HT-3)
 
         unsigned signals_tail_base = 0;         // Base signal ID for tail tracking (sender -> receiver)
         int num_max_rdma_chunked_send_tokens = NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE;
@@ -882,6 +883,9 @@ struct ncclEpGroup {
         // Config
         bool initialized;
         bool internode_initialized;
+        // Sender-side cumulative combine signal totals (unordered-fabric mode),
+        // [(rdma_team_size-1) * max_chunks] uint64, own allocation.
+        uint64_t* dev_combine_sent_totals = nullptr;
     } ht_buffers;
 
     // HT eager recv sizing (config.max_recv_tokens_per_rank == NCCL_EP_AUTO):
@@ -1413,6 +1417,10 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     size_t rdma_recv_packed_sz = align_size(
         static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry,
         GIN_ALIGNMENT);
+    // Unordered-fabric combine header slots (HT-3): [src_remote][chunk] uint64,
+    // mirroring the compact combine signal namespace.
+    size_t combine_header_sz = align_size(
+        static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t), GIN_ALIGNMENT);
 
     size_t total_gin_buffer_size = 0;
     total_gin_buffer_size += combine_gin_RED_tokens_sz;
@@ -1425,6 +1433,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     total_gin_buffer_size += dense_prob_sz;
     total_gin_buffer_size += rdma_send_staging_sz;
     total_gin_buffer_size += rdma_recv_packed_sz;
+    total_gin_buffer_size += combine_header_sz;
 
     NCCLCHECK(ncclMemAlloc(&ep_group->gin_config.gin_base_ptr, total_gin_buffer_size));
 
@@ -1466,6 +1475,12 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     offset += rdma_send_staging_sz;
 
+    // Skip the packed receive region (addressed by window+offset only).
+    offset += rdma_recv_packed_sz;
+    // Unordered-fabric combine header slots (HT-3): zeroed once at bootstrap.
+    CUDACHECK_RET(cudaMemset(ptr + offset, 0, combine_header_sz));
+    offset += combine_header_sz;
+
     // Calculate offsets for kernel mr_info
     size_t cur_offset = 0;
     ep_group->gin_config.combine_red_token_offset = cur_offset;
@@ -1499,6 +1514,11 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->gin_config.gin_recv_staging_offset = cur_offset;
     cur_offset += rdma_recv_packed_sz;
 
+    // Unordered-fabric combine header slots (HT-3), [src_remote][chunk] uint64,
+    // mirroring the combine signal namespace (see ht_ep.cuh).
+    ep_group->gin_config.combine_header_offset = cur_offset;
+    cur_offset += combine_header_sz;
+
     // =========================================================================
     // Phase 2: configure cross-LSA-team GIN resources
     // =========================================================================
@@ -1529,6 +1549,14 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // num_qp_per_rank is the total context budget; the data range is what's left after the reserved ones.
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS;
 
+    // Compact signal namespace: [src_remote][chunk] per direction (see
+    // dispatch_tail_signal_id in ht_ep.cuh). Signals are per-receiving-rank
+    // resources and rail comms pair equal local ranks, so the old
+    // [src][dst][lrank][chunk] namespaces (plus two regions with no device
+    // consumer at all) requested lsa*rdma-fold more indexed signals than the
+    // kernels wait on. On EFA GDA every indexed signal costs a signal/counter
+    // endpoint (2 HW counters) per GIN context against a ~256/NIC budget, so
+    // this compaction is what makes multi-SM HT fit on GDA at all.
     // GDA endpoint-budget preflight. On the EFA GDA backend an over-budget
     // request fails as an unexplained ENOMEM from fi_enable inside
     // createContext; compute the cost here and say what to change instead.
@@ -1583,6 +1611,17 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         // LSA barriers for the HT sync-guard: per-block dispatch [0, NUM_OF_BLOCKS) + one
         // for the elected combine-tail block [NUM_OF_BLOCKS]. NUM_OF_BLOCKS <= NCCL_EP_HT_DISPATCH_BLOCKS.
         reqs.lsaBarrierCount = NCCL_EP_HT_DISPATCH_BLOCKS + 1; // dispatch per-block [0,NB) + elected combine [NB]
+        if (nccl_ep_env_flag_on(ep_group->env.unordered_fabric)) {
+            // Unordered-fabric mode: the HT kernels use only weak indexed signals
+            // (per-put weak adds + cumulative headers; see ht_ep.cuh), so do not
+            // demand strong-signal or VA-signal support from the GIN backend. This
+            // is what lets backends without cross-put ordering proof -- EFA GDAKI,
+            // whose signals are write-with-immediate hardware counters -- pass
+            // DevComm validation. The legacy ncclGin_SignalAdd used elsewhere in
+            // these kernels resolves to weak via devComm->ginStrongLegacySignals.
+            reqs.ginStrongSignalsRequired = false;
+            reqs.ginVaSignalsRequired = false;
+        }
         NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
     }
 
@@ -1602,6 +1641,17 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         total_gin_buffer_size,
         &ep_group->gin_config.nccl_window,
         0));
+
+    // Sender-side cumulative combine signal totals (unordered-fabric mode).
+    // Device-resident and bumped in-kernel so CUDA-graph replays self-sequence.
+    {
+        const size_t totals_bytes =
+            static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t);
+        void* totals = nullptr;
+        CUDACHECK_RET(cudaMalloc(&totals, totals_bytes));
+        CUDACHECK_RET(cudaMemset(totals, 0, totals_bytes));
+        ep_group->ht_buffers.dev_combine_sent_totals = reinterpret_cast<uint64_t*>(totals);
+    }
 
     ep_group->ht_buffers.internode_initialized = true;
     return ncclSuccess;
@@ -1627,6 +1677,11 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
     if (ep_group->gin_config.d_dcomms != nullptr) {
         cudaFree(ep_group->gin_config.d_dcomms);
         ep_group->gin_config.d_dcomms = nullptr;
+    }
+    // Free the unordered-fabric sender totals
+    if (ep_group->ht_buffers.dev_combine_sent_totals != nullptr) {
+        cudaFree(ep_group->ht_buffers.dev_combine_sent_totals);
+        ep_group->ht_buffers.dev_combine_sent_totals = nullptr;
     }
 
     // Deregister the window
@@ -5297,6 +5352,8 @@ ncclResult_t ncclEpCombine(
             params.combine_grid_barrier_counter = group->ht_buffers.combine_grid_barrier_counter;
             params.lsa_S2G_flags = group->ht_buffers.combine_lsa_S2G_flags;
             params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
+            params.unordered_fabric = nccl_ep_env_flag_on(group->env.unordered_fabric);
+            params.combine_sent_totals = group->ht_buffers.dev_combine_sent_totals;
             const ncclWindow_t combine_token_window =
                 !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
             const size_t combine_token_offset =
@@ -5324,6 +5381,7 @@ ncclResult_t ncclEpCombine(
                 .combine_g2s_prob_offset =
                     is_lsa_only ? 0 : group->gin_config.combine_g2s_prob_offset,
                 .guard_offset = is_lsa_only ? 0 : group->gin_config.combine_guard_offset,
+                .combine_header_offset = is_lsa_only ? 0 : group->gin_config.combine_header_offset,
             };
             params.local_rank = group->lsa_rank;
             params.lsa_team = group->rdma_rank;
