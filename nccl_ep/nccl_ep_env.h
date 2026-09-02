@@ -57,6 +57,11 @@ struct ncclEpEnvConfig {
     // fusing them into the dispatch/combine kernels. Pull-push only.
     ncclEpEnvVar ht_unfused_sync{"NCCL_EP_HT_UNFUSED_SYNC", ncclEpEnvType::flag};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
+    // Unordered-fabric HT signaling (EFA/SRD): per-put weak signals + constant
+    // per-edge top-up instead of one strong tail signal that assumes same-QP
+    // put->signal ordering. Fixed at group creation; must not change between
+    // rounds of a live group.
+    ncclEpEnvVar unordered_fabric{"NCCL_EP_UNORDERED_FABRIC", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar shuffle_sms{"NCCL_EP_SHUFFLE_SMS", ncclEpEnvType::ulong};
@@ -65,6 +70,11 @@ struct ncclEpEnvConfig {
     // HT GIN contexts per rank; values below comm_sms*2 make channels share
     // contexts (device-scope). For EFA GDA endpoint budgets.
     ncclEpEnvVar qps_per_rank{"NCCL_EP_QPS_PER_RANK", ncclEpEnvType::ulong};
+    // Unordered-fabric dispatch: number of sub-puts per (chunk, edge). Each
+    // sub-put stages a token slice then puts it with a weak +1, overlapping
+    // staging copy with wire time (DeepEP-style staged transfers). The
+    // receiver waits round * subputs. Default 1 = single staged put.
+    ncclEpEnvVar dispatch_subputs{"NCCL_EP_DISPATCH_SUBPUTS", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_num_stages{"NCCL_EP_DISPATCH_NUM_STAGES", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_num_pipelines{"NCCL_EP_DISPATCH_NUM_PIPELINES", ncclEpEnvType::ulong};
     ncclEpEnvVar combine_num_stages_g2s{"NCCL_EP_COMBINE_NUM_STAGES_G2S", ncclEpEnvType::ulong};

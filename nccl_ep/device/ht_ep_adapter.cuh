@@ -488,6 +488,10 @@ struct DispatchParams {
     int local_dup_num_sms = 0;
 
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
+    bool unordered_fabric = false; // EFA/SRD-safe HT signaling (NCCL_EP_UNORDERED_FABRIC)
+    // Weak signals per (chunk, edge) per round: 1 ordered; NCCL_EP_DISPATCH_SUBPUTS
+    // when unordered (already normalized host-side).
+    int dispatch_subputs = 1;
 
     // Backstop bound for recv slot indices (see dispatch_kernel_param_base_t).
     int max_recv_tokens_per_rank = 0;

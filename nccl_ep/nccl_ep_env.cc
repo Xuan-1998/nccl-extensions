@@ -54,6 +54,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->ht_em_pull_push);
     parse_flag(cfg->ht_unfused_sync);
     parse_flag(cfg->disable_guard);
+    parse_flag(cfg->unordered_fabric);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
@@ -63,6 +64,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_ulong(cfg->preprocess_num_sms);
     parse_ulong(cfg->tokens_per_chunk);
     parse_ulong(cfg->qps_per_rank);
+    parse_ulong(cfg->dispatch_subputs);
     parse_ulong(cfg->dispatch_num_stages);
     parse_ulong(cfg->dispatch_num_pipelines);
     parse_ulong(cfg->combine_num_stages_g2s);
@@ -81,12 +83,14 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.ht_em_pull_push,
         &cfg.ht_unfused_sync,
         &cfg.disable_guard,
+        &cfg.unordered_fabric,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,
         &cfg.shuffle_sms,
         &cfg.preprocess_num_sms,
         &cfg.tokens_per_chunk,
         &cfg.qps_per_rank,
+        &cfg.dispatch_subputs,
         &cfg.dispatch_num_stages,
         &cfg.dispatch_num_pipelines,
         &cfg.combine_num_stages_g2s,
