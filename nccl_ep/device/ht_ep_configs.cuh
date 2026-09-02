@@ -49,7 +49,13 @@
 
 // Streaming overlap: tokens between drain+signal from reduction warp to RDMA warp.
 // 0 = disable streaming (fall back to chunk-level mbarrier only).
+// Tokens per combine N2N RDMA put on the streaming path. Overridable at build
+// time (-DNCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH=N): on EFA GDA, batch 32
+// cut combine put count 4x and raised combine 71.9 -> 77.0 GB/s at 8192
+// tokens (2x p5en, unordered mode); batch 64 measured the same as 32.
+#ifndef NCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH
 #define NCCL_EP_HT_COMBINE_RDMA_STREAMING_BATCH 8
+#endif
 
 // ============================================================================
 // GIN context reservation
