@@ -1024,6 +1024,14 @@ struct dispatch_kernel_param_base_t {
     // above it (DROP masks the rest), so the S2G assert only fires on corrupted
     // or stale routing maps.
     int max_recv_tokens_per_rank;
+    // Unordered-fabric mode (NCCL_EP_UNORDERED_FABRIC): the N2N warp stages each
+    // (chunk, edge)'s routed entries contiguously and issues a SINGLE batched put
+    // carrying a weak +1 on the edge's tail signal, so the receiver's wait proves
+    // per-put settlement instead of relying on same-QP put->signal ordering
+    // (which EFA/SRD does not provide). Must not change across rounds of a group.
+    bool unordered_fabric;
+    // Weak signals per (chunk, edge) per round (1 ordered; SUBPUTS unordered).
+    int dispatch_subputs;
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     dispatch_warp_timing_entry_t* warp_timing;
 #endif
@@ -1241,6 +1249,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const int local_rank,
     const int cidx,
     const uint64_t expected_flag_value,
+    const int dispatch_subputs,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int experts_per_rank,
@@ -1276,7 +1285,12 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
         const auto g2s_ctx_sharing = (NBLOCKS * N2N_WARPS <= num_ctx_per_comm)
             ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
         ncclGin net(dcomm, ctx_idx, g2s_ctx_sharing);
-        net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
+        // Every (chunk, edge) accrues exactly dispatch_subputs weak signals per
+        // round (1 in ordered mode). Each weak +1 settles with its own put, so
+        // reaching round * subputs proves the whole round's data settled -- sound
+        // without any ordering assumption.
+        net.waitSignal(ncclCoopThread(), tail_signal_id,
+                       expected_flag_value * static_cast<uint64_t>(dispatch_subputs));
 
         const int remote_slot = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
         const int chunk_first_token = cidx * TOKENS_PER_CHUNK;
@@ -1591,7 +1605,13 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     ncclWindow_t nccl_sf_window,
     ncclWindow_t nccl_internal_window,
     const struct dispatch_memory_region_info_t* mr_info,
-    SMEM_TYPE* smem_buffer_ptr) {
+    SMEM_TYPE* smem_buffer_ptr,
+    bool unordered_fabric,
+    int dispatch_subputs,
+    const TOKEN_DATA_TYPE* attn_input_token,
+    const float* attn_input_prob,
+    const uint8_t* attn_input_token_scaling_factor,
+    void* gin_base_ptr) {
     const int num_of_chunks_per_rank = nccl_ep::ceil_div(num_of_tokens_per_rank, TOKENS_PER_CHUNK);
 
     static_assert(GIN_GROUP::size() >= LSA_TEAMS - 1, "mr_info should be loaded at once.");
@@ -1646,6 +1666,18 @@ __forceinline__ __device__ void dispatch_N2N_warp(
             int remote_lteam_id = remote_idx < my_lteam ? remote_idx : remote_idx + 1;
             int remote_slot = remote_idx < my_lteam ? my_lteam - 1 : my_lteam;
 
+            // Tail-signal id for this (chunk, edge); needed up front in unordered-fabric
+            // mode, where the staged batch put carries a weak +1 on it.
+            unsigned tail_signal_id = dispatch_tail_signal_id(
+                smem_mr_info_ptr->signals_tail_base,
+                my_lteam,
+                remote_lteam_id,
+                local_rank,
+                cidx,
+                LSA_TEAMS,
+                LSA_TEAM_SZ,
+                MAX_CHUNKS_PER_RANK);
+
             size_t dense_dst_offset =
                 dispatch_packed_entry_offset(smem_mr_info_ptr, remote_slot, chunk_first_token_idx);
             const size_t entry_bytes = smem_mr_info_ptr->bytes_per_entry;
@@ -1658,6 +1690,98 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                     token_idx_in_chunk < csize &&
                     attn_to_rdma_map[((token_idx_in_chunk + chunk_first_token_idx) * NUM_REMOTE_LSA) + remote_idx];
                 need_write_bitmask[i] = __ballot_sync(~0u, need_write);
+            }
+
+            if (unordered_fabric) {
+                // HT-5: staged batch dispatch -- exactly ONE RDMA put per (chunk, edge).
+                //
+                // The per-token path below issues 2-3 independent puts per token (token,
+                // prob, sf), each its own WQE; on EFA GDA that is the dominant dispatch
+                // cost. Instead, the warp first packs every routed token's entry
+                // (token|prob|sf, the packed receive format) contiguously into this
+                // edge's slice of the send staging region, then one thread issues a
+                // single put covering all of them, carrying a weak +1 on the tail
+                // signal.
+                //
+                // This also collapses the ordering problem: with exactly one put per
+                // (chunk, edge) per round, its weak signal settling proves the entire
+                // round's data settled -- no top-up, no header, no ordering assumption.
+                // The receiver simply waits for the round counter, as in ordered mode.
+                // Zero-token chunks send a bare weak +1 so every edge still accrues
+                // exactly 1 per round.
+                const int lane_id_w = static_cast<int>(ncclCoopWarp().thread_rank());
+                const size_t staging_off = smem_mr_info_ptr->gin_send_staging_offset +
+                    (static_cast<size_t>(remote_slot) * smem_mr_info_ptr->max_tokens_per_dest +
+                     static_cast<size_t>(chunk_first_token_idx)) * entry_bytes;
+                uint8_t* staging_ptr = static_cast<uint8_t*>(gin_base_ptr) + staging_off;
+                const uint8_t* token_src_base = reinterpret_cast<const uint8_t*>(attn_input_token);
+                const uint8_t* prob_src_base = reinterpret_cast<const uint8_t*>(attn_input_prob);
+                // Sub-put slicing (NCCL_EP_DISPATCH_SUBPUTS, DeepEP-style staged
+                // transfers): stage one token slice, put it with a weak +1, then
+                // stage the next -- the NIC transmits slice i while the warp packs
+                // slice i+1, and several WQEs pipeline instead of one large one.
+                // Every (chunk, edge) emits exactly dispatch_subputs weak signals
+                // per round (empty slices send a bare weak +1), so the receiver
+                // waits for round * dispatch_subputs.
+                const int tokens_per_slice = nccl_ep::ceil_div(csize, dispatch_subputs);
+                int staged = 0;
+                for (int s = 0; s < dispatch_subputs; ++s) {
+                    const int slice_first_staged = staged;
+                    const int t_begin = s * tokens_per_slice;
+                    const int t_end = min(csize, t_begin + tokens_per_slice);
+                    for (int t = t_begin; t < t_end; ++t) {
+                        if (!(need_write_bitmask[t / 32] & (1u << (t % 32)))) continue;
+                        const size_t token_idx = static_cast<size_t>(chunk_first_token_idx) + t;
+                        uint8_t* dst = staging_ptr + static_cast<size_t>(staged) * entry_bytes;
+                        warp_copy_int4(dst, token_src_base + token_idx * token_bytes, token_bytes, lane_id_w);
+                        if constexpr (FORWARD_DISPATCH) {
+                            warp_copy_int4(
+                                dst + token_bytes,
+                                prob_src_base + (token_idx * LSA_TEAMS + remote_lteam_id) * prob_bytes,
+                                prob_bytes, lane_id_w);
+                        }
+                        if constexpr (HAS_SF) {
+                            warp_copy_int4(
+                                dst + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0),
+                                attn_input_token_scaling_factor + token_idx * sf_bytes_per_token,
+                                static_cast<size_t>(sf_bytes_per_token), lane_id_w);
+                        }
+                        ++staged;
+                    }
+                    __syncwarp();
+                    if (lane_id_w == 0) {
+                        const int slice_staged = staged - slice_first_staged;
+                        if (slice_staged > 0) {
+                            net.put(
+                                rail,
+                                remote_lteam_id,
+                                nccl_internal_window,
+                                dense_dst_offset + static_cast<size_t>(slice_first_staged) * entry_bytes,
+                                nccl_internal_window,
+                                staging_off + static_cast<size_t>(slice_first_staged) * entry_bytes,
+                                static_cast<size_t>(slice_staged) * entry_bytes,
+                                ncclGin_WeakSignalAdd{tail_signal_id, 1},
+                                ncclGin_None{},
+                                ncclCoopThread(),
+                                ncclGin_None{},
+                                cuda::thread_scope_thread,
+                                cuda::thread_scope_device,
+                                ncclGinOptFlagsDefault);
+                        } else {
+                            net.signal(
+                                rail,
+                                remote_lteam_id,
+                                ncclGin_WeakSignalAdd{tail_signal_id, 1},
+                                ncclCoopThread(),
+                                ncclGin_None{},
+                                cuda::thread_scope_thread,
+                                cuda::thread_scope_thread,
+                                ncclGinOptFlagsDefault);
+                        }
+                    }
+                    __syncwarp();
+                }
+                continue;
             }
 
             for (int token_idx_in_chunk = ncclCoopWarp().thread_rank(); token_idx_in_chunk < csize;
@@ -1697,15 +1821,8 @@ __forceinline__ __device__ void dispatch_N2N_warp(
 
             // Signal chunk completion on the SAME put comm: same-QP ordering makes all
             // preceding puts visible at the remote before this signal arrives.
-            unsigned tail_signal_id = dispatch_tail_signal_id(
-                smem_mr_info_ptr->signals_tail_base,
-                my_lteam,
-                remote_lteam_id,
-                local_rank,
-                cidx,
-                LSA_TEAMS,
-                LSA_TEAM_SZ,
-                MAX_CHUNKS_PER_RANK);
+            // NOTE: that contract holds on IB RC but NOT on EFA/SRD (multi-path
+            // delivery reorders puts); use NCCL_EP_UNORDERED_FABRIC there.
             net.signal(
                 rail,
                 remote_lteam_id,
@@ -1992,6 +2109,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     const int sf_bytes_per_token,
     const int experts_per_rank,
     const uint64_t expected_flag_value,
+    const int dispatch_subputs,
     const ncclDevComm& dcomm,
     int num_ctx_per_comm,
     void* gin_base_ptr,
@@ -2057,6 +2175,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     local_rank,
                     cidx,
                     expected_flag_value,
+                    dispatch_subputs,
                     HIDDEN_DIM,
                     sf_bytes_per_token,
                     experts_per_rank,
@@ -4125,7 +4244,13 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 param.sf_window,
                 param.dest_window,
                 &param.mr_info,
-                smem_buffer_ptr);
+                smem_buffer_ptr,
+                param.unordered_fabric,
+                param.dispatch_subputs,
+                param.attn_input_token,
+                param.attn_input_prob,
+                param.attn_input_token_scaling_factor,
+                param.gin_base_ptr);
 #undef DISPATCH_N2N_TEMPLATE
         }
     } else if (threadIdx_x_int < GIN_GROUP::size() + LSA_G2S_GROUP::size()) {
@@ -4146,6 +4271,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             SF_BYTES_PER_TOKEN,
             param.experts_per_rank,
             *param.expected_gin_flag_val,
+            param.dispatch_subputs,
             param.dcomm,
             param.num_ctx_per_comm,
             param.gin_base_ptr,

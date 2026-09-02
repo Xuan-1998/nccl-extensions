@@ -3978,6 +3978,13 @@ ncclResult_t ncclEpDispatch(
         params.lsa_S2G_flags = group->ht_buffers.dispatch_lsa_S2G_flags;
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
         params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
+        params.unordered_fabric = nccl_ep_env_flag_on(group->env.unordered_fabric);
+        // Weak signals per (chunk, edge) per round; >1 only in unordered mode.
+        params.dispatch_subputs = 1;
+        if (params.unordered_fabric && group->env.dispatch_subputs.is_set &&
+            group->env.dispatch_subputs.value.ul > 0) {
+            params.dispatch_subputs = static_cast<int>(group->env.dispatch_subputs.value.ul);
+        }
         // Pass device communicators and windows
         // Always pass a valid devComm (single-LSA-team too): the HT LSA sync-guard uses the NCCL LSA
         // barrier (needs comm.lsaBarrier). GIN/RDMA paths stay if-constexpr-gated (out single-LSA-team).
