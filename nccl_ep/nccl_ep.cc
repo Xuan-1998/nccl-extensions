@@ -24,6 +24,7 @@
 #include <nccl_device.h>
 #include "nccl_ep.h"
 #include "nccl_ep_env.h"
+#include "nccl_ep_gin_budget.h"
 #include "common.hpp"
 
 // HT (High Throughput) includes
@@ -1305,6 +1306,8 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
 static constexpr int NCCL_EP_HT_GIN_MAX_CONTEXTS = 32;
 static constexpr int NCCL_EP_HT_GIN_CTXS_PER_COMM = 4;
 static constexpr int MAX_BARRIER_SESSIONS = 32;
+static_assert(MAX_BARRIER_SESSIONS == nccl_ep::gin_budget::kBarrierSignalSlack,
+              "signal-space slack for barriers is defined in nccl_ep_gin_budget.h");
 
 static ncclResult_t
 init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
@@ -1482,7 +1485,12 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     int qps_per_rank = ep_group->config.num_qp_per_rank;
     int min_required_ctx = NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + (ep_group->comm_num_sms * NCCL_EP_HT_DISPATCH_N2N_WARPS);
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
-    if (qps_per_rank < min_required_ctx) {
+    if (ep_group->env.qps_per_rank.is_set && ep_group->env.qps_per_rank.value.ul > 0) {
+        // Fewer GIN contexts than channels: channels share contexts modularly and
+        // the kernels switch to device-scope resource sharing. Needed on EFA GDA,
+        // where per-context endpoint cost makes one context per channel unaffordable.
+        qps_per_rank = NCCL_EP_HT_RESERVED_GIN_GPU_CTXS + static_cast<int>(ep_group->env.qps_per_rank.value.ul);
+    } else if (qps_per_rank < min_required_ctx) {
         fprintf(stderr,
                 "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for reserved + dedicated N2N warp contexts\n",
                 qps_per_rank, min_required_ctx);
@@ -1493,15 +1501,35 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // num_qp_per_rank is the total context budget; the data range is what's left after the reserved ones.
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS;
 
-    int dispatch_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
-    int combine_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
-    int streaming_tail_signals = rdma_team_size * rdma_team_size * lsa_team_size * max_chunks_per_rank;
-    int streaming_head_signals = rdma_team_size * rdma_team_size * lsa_team_size;
+    // GDA endpoint-budget preflight. On the EFA GDA backend an over-budget
+    // request fails as an unexplained ENOMEM from fi_enable inside
+    // createContext; compute the cost here and say what to change instead.
+    // Rail count is not knowable portably at this layer, so warn for the
+    // worst case (all contexts on one NIC) and print the 2-rail number too.
+    {
+        namespace gb = nccl_ep::gin_budget;
+        const int n_signals = nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
+        if (!gb::fits_gda_budget(qps_per_rank, /*num_rails=*/1, n_signals) && ep_group->rank == 0) {
+            fprintf(stderr,
+                    "[HT GIN] budget note: %d contexts x %d signals costs %d counters/NIC on 1 rail "
+                    "(%d on 2 rails) against ~%d; on EFA GDA an over-budget request fails as "
+                    "fi_enable ENOMEM in createContext. Largest context count that fits at this "
+                    "signal count: %d (2 rails). Reduce NCCL_EP_QPS_PER_RANK or chunk count "
+                    "(NCCL_EP_TOKENS_PER_CHUNK).\n",
+                    qps_per_rank, n_signals,
+                    gb::counters_per_nic(qps_per_rank, 1, n_signals),
+                    gb::counters_per_nic(qps_per_rank, 2, n_signals),
+                    gb::kCountersPerNicBudget,
+                    gb::max_contexts_for(2, n_signals));
+        }
+    }
+
     ep_group->gin_config.num_total_signals =
-        dispatch_signals + combine_signals + streaming_tail_signals + streaming_head_signals + MAX_BARRIER_SESSIONS;
+        nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
     ep_group->gin_config.signals_base = 0;
-    ep_group->gin_config.combine_signal_offset = dispatch_signals;
-    ep_group->gin_config.signals_tail_base = dispatch_signals + combine_signals;
+    ep_group->gin_config.combine_signal_offset = nccl_ep::gin_budget::combine_signal_offset();
+    ep_group->gin_config.signals_tail_base =
+        nccl_ep::gin_budget::dispatch_tail_base(rdma_team_size, max_chunks_per_rank);
 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)

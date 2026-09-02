@@ -91,8 +91,12 @@ struct dispatch_memory_region_info_t {
     int num_max_rdma_chunked_send_tokens; // Batch size per RDMA put (default: 6)
 } __attribute__((__aligned__(8)));
 
-// Tail-signal id for the (src_lteam -> dst_lteam) edge of (local_rank, chunk);
-// namespace [src][dst][local_rank][chunk].
+// Tail-signal id for the (src_lteam -> dst_lteam) edge of chunk; namespace [src_remote][chunk].
+// Signals are per-receiving-rank resources and rail comms pair equal local ranks, so the
+// old [src][dst][local_rank][chunk] namespace wasted a factor of lsa_teams *
+// ranks_per_lsa_team: dst and local_rank are constants at any given receiver. Compacting
+// matters on EFA GDA, where every indexed signal costs a signal/counter endpoint (2 HW
+// counters) per GIN context and the per-NIC budget is ~256.
 __forceinline__ __device__ unsigned dispatch_tail_signal_id(
     unsigned signals_tail_base,
     int src_lteam,
@@ -102,8 +106,9 @@ __forceinline__ __device__ unsigned dispatch_tail_signal_id(
     int lsa_teams,
     int ranks_per_lsa_team,
     int max_chunks_per_rank) {
-    return signals_tail_base +
-           ((src_lteam * lsa_teams + dst_lteam) * ranks_per_lsa_team + local_rank) * max_chunks_per_rank + cidx;
+    (void)lsa_teams; (void)ranks_per_lsa_team; (void)local_rank;
+    const int src_remote = src_lteam < dst_lteam ? src_lteam : src_lteam - 1;
+    return signals_tail_base + static_cast<unsigned>(src_remote * max_chunks_per_rank + cidx);
 }
 
 // Byte offset (from the packed inter-lsa-team receive region start) of one source slot's chunk.
@@ -1266,7 +1271,11 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
         int signal_channel = cidx % (NBLOCKS * N2N_WARPS);
 
         int ctx_idx = get_data_ctx(signal_channel, num_ctx_per_comm);
-        ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
+        // When there are fewer GIN contexts than channels (EFA GDA endpoint budget),
+        // one context is shared by channels in different CTAs: device-scope resources.
+        const auto g2s_ctx_sharing = (NBLOCKS * N2N_WARPS <= num_ctx_per_comm)
+            ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
+        ncclGin net(dcomm, ctx_idx, g2s_ctx_sharing);
         net.waitSignal(ncclCoopThread(), tail_signal_id, expected_flag_value);
 
         const int remote_slot = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
@@ -1613,7 +1622,11 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     int global_channel = blockIdx.x * N2N_WARPS + n2n_warp_id;
     int ctx_idx = get_data_ctx(global_channel, num_ctx_per_comm);
 
-    ncclGin net(dcomm, ctx_idx, NCCL_GIN_RESOURCE_SHARING_CTA);
+    // When there are fewer GIN contexts than channels (EFA GDA endpoint budget),
+    // one context is shared by channels in different CTAs: device-scope resources.
+    const auto n2n_ctx_sharing = (NBLOCKS * N2N_WARPS <= num_ctx_per_comm)
+        ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
+    ncclGin net(dcomm, ctx_idx, n2n_ctx_sharing);
     ncclTeam rail = ncclTeamRail(dcomm);
 
     for (int cidx = blockIdx.x * N2N_WARPS + n2n_warp_id; cidx < MAX_CHUNKS_PER_RANK;
@@ -2910,9 +2923,11 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
     unsigned signals_base,
     unsigned combine_signal_offset) {
     constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
+    // Compact [src_remote][chunk] namespace; see dispatch_tail_signal_id.
+    (void)local_rank;
+    const int combine_src_remote = my_lteam < lteam_id ? my_lteam : my_lteam - 1;
     unsigned signal_id = signals_base + combine_signal_offset +
-                         local_rank * (LSA_TEAMS * MAX_CHUNKS_PER_RANK) + my_lteam * MAX_CHUNKS_PER_RANK +
-                         chunk_id;
+                         static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + chunk_id);
     net.signal(
         rail,
         lteam_id,
@@ -3316,9 +3331,11 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                 ncclGin net(dcomms[comm_idx], ctx_idx);
                 for (int n = 1; n < LSA_TEAMS; n++) {
                     int signal_lteam_id = my_lteam >= n ? my_lteam - n : my_lteam + LSA_TEAMS - n;
+                    // Compact [src_remote][chunk] namespace; see dispatch_tail_signal_id.
+                    const int combine_src_remote =
+                        signal_lteam_id < my_lteam ? signal_lteam_id : signal_lteam_id - 1;
                     unsigned signal_id = signals_base + combine_signal_offset +
-                                         local_rank * (LSA_TEAMS * MAX_CHUNKS_PER_RANK) +
-                                         signal_lteam_id * MAX_CHUNKS_PER_RANK + cidx;
+                                         static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + cidx);
                     net.waitSignal(ncclCoopThread(), signal_id, expected_flag_value);
                 }
             }
