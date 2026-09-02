@@ -1238,6 +1238,8 @@ ncclResult_t call_dispatch(
     kp.lsa_S2G_flags = params.lsa_S2G_flags;
     kp.combine_grid_barrier_counter = params.combine_grid_barrier_counter;
     kp.guard_enabled = params.guard_enabled;
+    kp.unordered_fabric = params.unordered_fabric;
+    kp.combine_sent_totals = params.combine_sent_totals;
 
     // Runtime config
     kp.local_rank = params.local_rank;
@@ -1262,7 +1264,8 @@ ncclResult_t call_dispatch(
         .combine_g2s_token_offset = params.mr_info.combine_g2s_token_offset,
         .combine_red_prob_offset = params.mr_info.combine_red_prob_offset,
         .combine_g2s_prob_offset = params.mr_info.combine_g2s_prob_offset,
-        .guard_offset = params.mr_info.guard_offset
+        .guard_offset = params.mr_info.guard_offset,
+        .combine_header_offset = params.mr_info.combine_header_offset
     };
 
     return kp;
