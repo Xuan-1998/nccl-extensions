@@ -24,7 +24,46 @@ Python package (`nccl-extensions`) providing Pythonic wrappers for `nccl_ep`
 and `nccl_m2n` as `nccl.ep` and `nccl.m2n`. See
 [`python/README.md`](python/README.md) for details.
 
-## Getting Started
+## Installation
+
+Prebuilt Python wheels are available from
+[PyPI](https://pypi.org/project/nccl-extensions/) for Linux on x86-64 and
+aarch64, with CPython 3.10 through 3.14.
+
+Choose the extra matching your CUDA major version:
+
+```bash
+# CUDA 12
+python -m pip install "nccl-extensions[cu12]"
+
+# CUDA 13
+python -m pip install "nccl-extensions[cu13]"
+```
+
+The CUDA extras are mutually exclusive. Each extra installs the corresponding
+CUDA runtime dependencies and **exactly NCCL 2.30.7**. Other NCCL versions have
+not yet been validated and are not guaranteed to work.
+
+NCCL EP compiles kernels at runtime. Its CUDA toolkit, including `nvcc` and
+headers, must match the selected CUDA major version. Set `CUDA_HOME` when the
+toolkit is not discoverable automatically.
+
+Verify the installation:
+
+```bash
+python - <<'PY'
+from importlib.metadata import version
+import nccl.ep
+import nccl.m2n
+
+print(version("nccl-extensions"))
+PY
+```
+
+See [`python/README.md`](python/README.md) for package layout, API usage, and
+editable installation details.
+
+## Building from source
 
 This repo vendors NCCL as a git submodule. Clone with:
 
