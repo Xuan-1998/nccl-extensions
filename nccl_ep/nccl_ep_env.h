@@ -62,6 +62,11 @@ struct ncclEpEnvConfig {
     // put->signal ordering. Fixed at group creation; must not change between
     // rounds of a live group.
     ncclEpEnvVar unordered_fabric{"NCCL_EP_UNORDERED_FABRIC", ncclEpEnvType::flag};
+    // Shared-signal unordered mode: signals are per (edge, ctx-slot) instead of
+    // per (edge, chunk); per-chunk headers carry cumulative totals in BOTH
+    // directions. Decouples signal count from chunk count so more GIN contexts
+    // fit the EFA GDA endpoint budget. Requires unordered_fabric.
+    ncclEpEnvVar shared_signals{"NCCL_EP_SHARED_SIGNALS", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar shuffle_sms{"NCCL_EP_SHUFFLE_SMS", ncclEpEnvType::ulong};

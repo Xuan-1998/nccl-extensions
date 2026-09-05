@@ -410,6 +410,7 @@ struct dispatch_memory_region_info_t {
     size_t gin_send_staging_offset; // Offset of per-destination staging buffer
     size_t gin_recv_staging_offset; // Offset of packed receive buffer (token+prob+sf per entry)
     size_t guard_offset; // Offset of RDMA sync-guard readiness flags (NUM_LSA_TEAMS uint64 slots)
+    size_t dispatch_header_offset; // shared-signal dispatch header slots
     size_t bytes_per_entry; // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest; // Max tokens that can be staged per destination
     // Streaming RDMA signals
@@ -493,6 +494,8 @@ struct DispatchParams {
     // Weak signals per (chunk, edge) per round: 1 ordered; NCCL_EP_DISPATCH_SUBPUTS
     // when unordered (already normalized host-side).
     int dispatch_subputs = 1;
+    bool shared_signals = false; // per (edge, ctx-slot) signals + per-chunk headers
+    uint64_t* dispatch_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
 
     // Backstop bound for recv slot indices (see dispatch_kernel_param_base_t).
     int max_recv_tokens_per_rank = 0;
@@ -584,6 +587,8 @@ struct CombineParams {
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
     bool unordered_fabric = false; // EFA/SRD-safe HT signaling (NCCL_EP_UNORDERED_FABRIC)
     uint64_t* combine_sent_totals = nullptr; // sender cumulative signal totals (unordered mode)
+    bool shared_signals = false; // per (edge, ctx-slot) signals + per-chunk headers
+    uint64_t* combine_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
 };
 
 // Call combine kernel with runtime template parameter resolution

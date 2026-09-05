@@ -150,6 +150,7 @@ struct dispatch_memory_region_info_t {
     size_t gin_send_staging_offset;           // Offset of per-destination staging buffer
     size_t gin_recv_staging_offset; // Offset of packed receive buffer (token+prob+sf per entry)
     size_t guard_offset; // Offset of RDMA sync-guard readiness flags (LSA_TEAMS uint64 slots)
+    size_t dispatch_header_offset; // shared-signal dispatch header slots
     size_t bytes_per_entry; // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest; // Max tokens that can be staged per destination
     // Streaming RDMA signals
@@ -176,6 +177,16 @@ __forceinline__ __device__ unsigned dispatch_tail_signal_id(
     (void)lsa_teams; (void)ranks_per_lsa_team; (void)local_rank;
     const int src_remote = src_lteam < dst_lteam ? src_lteam : src_lteam - 1;
     return signals_tail_base + static_cast<unsigned>(src_remote * max_chunks_per_rank + cidx);
+}
+
+// Shared-signal mode: one signal per (edge, ctx-slot) instead of per (edge, chunk).
+// Chunks map to slots as their data channel % num_ctx, identically on sender and
+// receiver, so both sides name the same signal. Per-chunk headers carry the
+// slot-cumulative totals that make the shared counter provable per chunk.
+__forceinline__ __device__ unsigned shared_edge_signal_id(
+    unsigned base, int src_lteam, int dst_lteam, int ctx_slot, int num_ctx) {
+    const int src_remote = src_lteam < dst_lteam ? src_lteam : src_lteam - 1;
+    return base + static_cast<unsigned>(src_remote * num_ctx + ctx_slot);
 }
 
 // Byte offset (from the packed inter-lsa-team receive region start) of one source slot's chunk.
@@ -1059,6 +1070,9 @@ struct dispatch_kernel_param_base_t {
     bool unordered_fabric;
     // Weak signals per (chunk, edge) per round (1 ordered; SUBPUTS unordered).
     int dispatch_subputs;
+    // Shared-signal mode (NCCL_EP_SHARED_SIGNALS): see shared_edge_signal_id.
+    bool shared_signals;
+    uint64_t* dispatch_edge_totals; // per (edge, ctx-slot) atomic totals
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     dispatch_warp_timing_entry_t* warp_timing;
 #endif
@@ -1132,6 +1146,9 @@ struct combine_kernel_param_base_t {
     // so CUDA-graph replays self-sequence (same pattern as expected_gin_flag_val).
     // Only touched in unordered-fabric mode.
     uint64_t* combine_sent_totals;
+    // Shared-signal mode (NCCL_EP_SHARED_SIGNALS): see shared_edge_signal_id.
+    bool shared_signals;
+    uint64_t* combine_edge_totals; // per (edge, ctx-slot) atomic totals
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     combine_warp_timing_entry_t* warp_timing;
     combine_block_timing_entry_t* block_timing;
@@ -1277,6 +1294,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const int cidx,
     const uint64_t expected_flag_value,
     const int dispatch_subputs,
+    const bool shared_signals,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int experts_per_rank,
@@ -1312,12 +1330,34 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
         const auto g2s_ctx_sharing = (NBLOCKS * N2N_WARPS <= num_ctx_per_comm)
             ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
         ncclGin net(dcomm, ctx_idx, g2s_ctx_sharing);
-        // Every (chunk, edge) accrues exactly dispatch_subputs weak signals per
-        // round (1 in ordered mode). Each weak +1 settles with its own put, so
-        // reaching round * subputs proves the whole round's data settled -- sound
-        // without any ordering assumption.
-        net.waitSignal(ncclCoopThread(), tail_signal_id,
-                       expected_flag_value * static_cast<uint64_t>(dispatch_subputs));
+        if (shared_signals) {
+            // Shared-signal mode: poll this chunk's header for the round tag, read
+            // the slot-cumulative total, and wait the (edge, ctx-slot) signal to
+            // that absolute total. The signal is monotonic and addition commutes,
+            // so reaching the total proves every put counted into it (all of this
+            // chunk's, possibly some of its slot-mates') has settled.
+            const int ctx_slot_r = signal_channel % num_ctx_per_comm;
+            const unsigned shared_id = shared_edge_signal_id(
+                mr_info->signals_tail_base, lteam_id, my_lteam, ctx_slot_r, num_ctx_per_comm);
+            const int src_remote_r = lteam_id < my_lteam ? lteam_id : lteam_id - 1;
+            constexpr int MAX_CHUNKS_R = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
+            const uint64_t* headers = reinterpret_cast<const uint64_t*>(
+                static_cast<const uint8_t*>(gin_base_ptr) + mr_info->dispatch_header_offset);
+            const size_t hdr_idx = static_cast<size_t>(src_remote_r) * MAX_CHUNKS_R + cidx;
+            const uint32_t tag = static_cast<uint32_t>(expected_flag_value);
+            uint64_t hdr;
+            do {
+                hdr = nccl_ep::ld_relaxed_sys_global(&headers[hdr_idx]);
+            } while (static_cast<uint32_t>(hdr >> 32) != tag);
+            net.waitSignal(ncclCoopThread(), shared_id, hdr & 0xffffffffull, /*bits=*/32);
+        } else {
+            // Every (chunk, edge) accrues exactly dispatch_subputs weak signals per
+            // round (1 in ordered mode). Each weak +1 settles with its own put, so
+            // reaching round * subputs proves the whole round's data settled -- sound
+            // without any ordering assumption.
+            net.waitSignal(ncclCoopThread(), tail_signal_id,
+                           expected_flag_value * static_cast<uint64_t>(dispatch_subputs));
+        }
 
         const int remote_slot = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
         const int chunk_first_token = cidx * TOKENS_PER_CHUNK;
@@ -1635,6 +1675,9 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     SMEM_TYPE* smem_buffer_ptr,
     bool unordered_fabric,
     int dispatch_subputs,
+    bool shared_signals,
+    uint64_t* dispatch_edge_totals,
+    uint64_t expected_flag_value,
     const TOKEN_DATA_TYPE* attn_input_token,
     const float* attn_input_prob,
     const uint8_t* attn_input_token_scaling_factor,
@@ -1750,6 +1793,15 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 // Every (chunk, edge) emits exactly dispatch_subputs weak signals
                 // per round (empty slices send a bare weak +1), so the receiver
                 // waits for round * dispatch_subputs.
+                // Shared-signal mode: +1s ride the (edge, ctx-slot) signal and a
+                // per-chunk header publishes the slot-cumulative total.
+                const int ctx_slot = global_channel % num_ctx_per_comm;
+                const unsigned slice_signal_id = shared_signals
+                    ? shared_edge_signal_id(smem_mr_info_ptr->signals_tail_base,
+                                            my_lteam, remote_lteam_id, ctx_slot, num_ctx_per_comm)
+                    : tail_signal_id;
+                const int edge_slot_idx =
+                    (my_lteam < remote_lteam_id ? my_lteam : my_lteam - 1) * num_ctx_per_comm + ctx_slot;
                 const int tokens_per_slice = nccl_ep::ceil_div(csize, dispatch_subputs);
                 int staged = 0;
                 for (int s = 0; s < dispatch_subputs; ++s) {
@@ -1787,7 +1839,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                                 nccl_internal_window,
                                 staging_off + static_cast<size_t>(slice_first_staged) * entry_bytes,
                                 static_cast<size_t>(slice_staged) * entry_bytes,
-                                ncclGin_WeakSignalAdd{tail_signal_id, 1},
+                                ncclGin_WeakSignalAdd{slice_signal_id, 1},
                                 ncclGin_None{},
                                 ncclCoopThread(),
                                 ncclGin_None{},
@@ -1798,16 +1850,41 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                             net.signal(
                                 rail,
                                 remote_lteam_id,
-                                ncclGin_WeakSignalAdd{tail_signal_id, 1},
+                                ncclGin_WeakSignalAdd{slice_signal_id, 1},
                                 ncclCoopThread(),
                                 ncclGin_None{},
                                 cuda::thread_scope_thread,
                                 cuda::thread_scope_thread,
                                 ncclGinOptFlagsDefault);
                         }
+                        if (shared_signals) {
+                            // Count this slice's +1 into the slot total (order vs the
+                            // put does not matter: totals may only over-cover).
+                            atomicAdd(reinterpret_cast<unsigned long long*>(
+                                          &dispatch_edge_totals[edge_slot_idx]), 1ull);
+                        }
                     }
                     __syncwarp();
                 }
+                if (shared_signals && lane_id_w == 0) {
+                    // Per-chunk header: publish the slot-cumulative total at the point
+                    // all of this chunk's +1s are counted, tagged with the round. The
+                    // header putValue itself rides one more weak +1 (also counted).
+                    const uint64_t new_total = atomicAdd(reinterpret_cast<unsigned long long*>(
+                                                   &dispatch_edge_totals[edge_slot_idx]), 1ull) + 1ull;
+                    const uint64_t hdr = (expected_flag_value << 32) | (new_total & 0xffffffffull);
+                    const unsigned hdr_slot = static_cast<unsigned>(
+                        (my_lteam < remote_lteam_id ? my_lteam : my_lteam - 1) * MAX_CHUNKS_PER_RANK + cidx);
+                    net.putValue(
+                        rail,
+                        remote_lteam_id,
+                        nccl_internal_window,
+                        smem_mr_info_ptr->dispatch_header_offset + static_cast<size_t>(hdr_slot) * sizeof(uint64_t),
+                        hdr,
+                        ncclGin_WeakSignalAdd{slice_signal_id, 1},
+                        ncclCoopThread());
+                }
+                __syncwarp();
                 continue;
             }
 
@@ -2137,6 +2214,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     const int experts_per_rank,
     const uint64_t expected_flag_value,
     const int dispatch_subputs,
+    const bool shared_signals,
     const ncclDevComm& dcomm,
     int num_ctx_per_comm,
     void* gin_base_ptr,
@@ -2203,6 +2281,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     cidx,
                     expected_flag_value,
                     dispatch_subputs,
+                    shared_signals,
                     HIDDEN_DIM,
                     sf_bytes_per_token,
                     experts_per_rank,
@@ -3118,7 +3197,11 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
     uint64_t* combine_sent_totals,
     ncclWindow_t nccl_internal_window,
     const struct combine_memory_region_info_t* smem_mr_info_ptr,
-    int n_weak_puts) {
+    int n_weak_puts,
+    bool shared_signals,
+    unsigned shared_sig_id,
+    uint64_t* combine_edge_totals,
+    int edge_slot_idx) {
     constexpr int MAX_CHUNKS_PER_RANK = MAX_TOKENS_PER_RANK / TOKENS_PER_CHUNK;
     // Compact [src_remote][chunk] namespace; see dispatch_tail_signal_id.
     (void)local_rank;
@@ -3126,9 +3209,21 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
     unsigned signal_id = signals_base + combine_signal_offset +
                          static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + chunk_id);
     if (unordered_fabric) {
-        const unsigned hdr_idx = signal_id - signals_base - combine_signal_offset;
-        const uint64_t new_total = combine_sent_totals[hdr_idx] + static_cast<uint64_t>(n_weak_puts) + 1;
-        combine_sent_totals[hdr_idx] = new_total;
+        // Header slot stays per (src_remote, chunk) in both sub-modes; what varies
+        // is which signal the +1s ride and whose cumulative total the header carries.
+        const unsigned hdr_idx = static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + chunk_id);
+        uint64_t new_total;
+        unsigned ride_id = signal_id;
+        if (shared_signals) {
+            new_total = atomicAdd(reinterpret_cast<unsigned long long*>(
+                            &combine_edge_totals[edge_slot_idx]),
+                            static_cast<unsigned long long>(n_weak_puts) + 1ull) +
+                        static_cast<uint64_t>(n_weak_puts) + 1ull;
+            ride_id = shared_sig_id;
+        } else {
+            new_total = combine_sent_totals[hdr_idx] + static_cast<uint64_t>(n_weak_puts) + 1;
+            combine_sent_totals[hdr_idx] = new_total;
+        }
         const uint64_t hdr = (expected_flag_value << 32) | (new_total & 0xffffffffull);
         net.putValue(
             rail,
@@ -3136,7 +3231,7 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
             nccl_internal_window,
             smem_mr_info_ptr->combine_header_offset + static_cast<size_t>(hdr_idx) * sizeof(uint64_t),
             hdr,
-            ncclGin_WeakSignalAdd{signal_id, 1},
+            ncclGin_WeakSignalAdd{ride_id, 1},
             ncclCoopThread());
     } else {
         net.signal(
@@ -3186,7 +3281,9 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
     unsigned combine_signal_offset,
     bool unordered_fabric,
     uint64_t expected_flag_value,
-    uint64_t* combine_sent_totals) {
+    uint64_t* combine_sent_totals,
+    bool shared_signals,
+    uint64_t* combine_edge_totals) {
     // Token RDMA offsets/sizes below scale by size_u8 (4 B for FP32, 2 B for BF16/FP16);
     // prob is always float and is unaffected.
     // Load rdma_to_attn_map using LDG.128. Each token will need 1 bool from this map.
@@ -3250,6 +3347,12 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         const int combine_src_remote_s = my_lteam < lteam_id ? my_lteam : my_lteam - 1;
         const unsigned combine_tail_signal_id = signals_base + combine_signal_offset +
             static_cast<unsigned>(combine_src_remote_s * kMaxChunksPerRank + chunk_id);
+        // Shared-signal mode: +1s ride the (edge, ctx-slot) signal instead.
+        const int c_ctx_slot = global_channel % num_ctx_per_comm;
+        const unsigned c_shared_id = signals_base + combine_signal_offset +
+            static_cast<unsigned>(combine_src_remote_s * num_ctx_per_comm + c_ctx_slot);
+        const unsigned put_signal_id = shared_signals ? c_shared_id : combine_tail_signal_id;
+        const int c_edge_slot_idx = combine_src_remote_s * num_ctx_per_comm + c_ctx_slot;
         int n_weak_puts = 0;
         if constexpr (STREAMING_BATCH > 0) {
             // ---- STREAMING PATH: process tokens as reduction warp produces them ----
@@ -3262,7 +3365,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
                     rdma_to_attn_map, chunk_base_token_idx, chunk_id * TOKENS_PER_CHUNK, token_range,
                     rdma_tile_id, rank_in_remote, experts_per_rank * LSA_TEAM_SZ,
                     (volatile uint32_t*)smem_buffer_ptr->rdma_streaming_counter, cumulative_sent,
-                    unordered_fabric, combine_tail_signal_id, n_weak_puts);
+                    unordered_fabric, put_signal_id, n_weak_puts);
             }
 
             // Wait for mbarrier (parity tracking -- reduction warp always arrives)
@@ -3280,7 +3383,8 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
                 combine_n2n_signal_remote<MAX_TOKENS_PER_RANK, TOKENS_PER_CHUNK, LSA_TEAMS>(
                     net, rail, lteam_id, local_rank, my_lteam, chunk_id, signals_base, combine_signal_offset,
                     unordered_fabric, expected_flag_value, combine_sent_totals,
-                    nccl_internal_window, smem_mr_info_ptr, n_weak_puts);
+                    nccl_internal_window, smem_mr_info_ptr, n_weak_puts,
+                    shared_signals, c_shared_id, combine_edge_totals, c_edge_slot_idx);
             }
             __syncwarp();
 
@@ -3304,7 +3408,7 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
                     rdma_to_attn_map, chunk_base_token_idx, chunk_id * TOKENS_PER_CHUNK, token_range,
                     rdma_tile_id, rank_in_remote, experts_per_rank * LSA_TEAM_SZ,
                     nullptr, cumulative_sent,
-                    unordered_fabric, combine_tail_signal_id, n_weak_puts);
+                    unordered_fabric, put_signal_id, n_weak_puts);
             }
 
             // Signal remote
@@ -3313,7 +3417,8 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
                 combine_n2n_signal_remote<MAX_TOKENS_PER_RANK, TOKENS_PER_CHUNK, LSA_TEAMS>(
                     net, rail, lteam_id, local_rank, my_lteam, chunk_id, signals_base, combine_signal_offset,
                     unordered_fabric, expected_flag_value, combine_sent_totals,
-                    nccl_internal_window, smem_mr_info_ptr, n_weak_puts);
+                    nccl_internal_window, smem_mr_info_ptr, n_weak_puts,
+                    shared_signals, c_shared_id, combine_edge_totals, c_edge_slot_idx);
             }
             __syncwarp();
         }
@@ -3481,6 +3586,7 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
     const uint64_t expected_flag_value,
     const bool combine_local_reduce_enabled,
     const bool unordered_fabric,
+    const bool shared_signals,
     const uint64_t* combine_headers,
     // CONFIG: ncclGin RDMA plumbing
     ncclDevComm_t* dcomms,
@@ -3566,6 +3672,12 @@ __forceinline__ __device__ void combine_G2S_inter_warp(
                         signal_lteam_id < my_lteam ? signal_lteam_id : signal_lteam_id - 1;
                     unsigned signal_id = signals_base + combine_signal_offset +
                                          static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + cidx);
+                    if (shared_signals) {
+                        // Shared-signal mode: same slot mapping as the sender.
+                        signal_id = signals_base + combine_signal_offset +
+                                    static_cast<unsigned>(combine_src_remote * num_ctx_per_comm +
+                                                          (global_channel % num_ctx_per_comm));
+                    }
                     if (unordered_fabric) {
                         // Cumulative-header protocol (HT-3): poll the iteration-tagged
                         // header the sender putValue()d for this (chunk, edge); it carries
@@ -4376,6 +4488,9 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 smem_buffer_ptr,
                 param.unordered_fabric,
                 param.dispatch_subputs,
+                param.shared_signals,
+                param.dispatch_edge_totals,
+                *param.expected_gin_flag_val,
                 param.attn_input_token,
                 param.attn_input_prob,
                 param.attn_input_token_scaling_factor,
@@ -4401,6 +4516,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.experts_per_rank,
             *param.expected_gin_flag_val,
             param.dispatch_subputs,
+            param.shared_signals,
             param.dcomm,
             param.num_ctx_per_comm,
             param.gin_base_ptr,
@@ -4742,6 +4858,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             *param.expected_gin_flag_val,
             param.combine_local_reduce_enabled,
             param.unordered_fabric,
+            param.shared_signals,
             reinterpret_cast<const uint64_t*>(
                 static_cast<const uint8_t*>(param.gin_base_ptr) + param.mr_info.combine_header_offset),
             param.dcomms,
@@ -4781,7 +4898,9 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 param.combine_signal_offset,
                 param.unordered_fabric,
                 *param.expected_gin_flag_val,
-                param.combine_sent_totals);
+                param.combine_sent_totals,
+                param.shared_signals,
+                param.combine_edge_totals);
 #undef COMBINE_N2N_INTER_TEMPLATE
         }
     } else {

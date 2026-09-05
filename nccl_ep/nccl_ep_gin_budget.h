@@ -75,6 +75,34 @@ __host__ __device__ constexpr int total_signals(int rdma_team_size, int max_chun
     return 2 * edge_chunk_signals(rdma_team_size, max_chunks_per_rank) + kBarrierSignalSlack;
 }
 
+// ---------------------------------------------------------------------------
+// Shared-signal mode (NCCL_EP_SHARED_SIGNALS): signals are per (edge, ctx-slot)
+// instead of per (edge, chunk). Chunks map to ctx slots as chunk % nctx, every
+// put carries a weak +1 on its slot's signal, and a per-chunk header (putValue,
+// riding its own weak +1) publishes the slot's cumulative total at the point
+// this chunk's puts were all issued. The receiver polls the header for its
+// round tag and waits the shared signal to the absolute total: the signal is
+// monotonic and addition commutes, so reaching the total proves every put this
+// chunk issued has settled -- same argument as the combine header protocol,
+// generalized to a signal shared by chunks. This decouples the signal count
+// from the chunk count: cost scales with contexts, not pipeline depth, which
+// is what lets 4 contexts fit the endpoint budget at chunk 256.
+__host__ __device__ constexpr int edge_slot_signals(int rdma_team_size, int num_ctx) {
+    return (rdma_team_size - 1) * num_ctx;
+}
+
+__host__ __device__ constexpr int shared_combine_signal_offset() {
+    return 0;
+}
+
+__host__ __device__ constexpr int shared_dispatch_tail_base(int rdma_team_size, int num_ctx) {
+    return edge_slot_signals(rdma_team_size, num_ctx);
+}
+
+__host__ __device__ constexpr int shared_total_signals(int rdma_team_size, int num_ctx) {
+    return 2 * edge_slot_signals(rdma_team_size, num_ctx) + kBarrierSignalSlack;
+}
+
 // The two directions must tile the space exactly, with combine first: the
 // kernels derive header-slot indices as (signal_id - combine base), so any
 // gap or reordering here corrupts the header region silently.
@@ -120,6 +148,9 @@ static_assert(fits_gda_budget(/*ctx=*/2, /*rails=*/2, total_signals(2, 16)),
               "the validated p5en config (2 contexts, 64 signals) must fit");
 static_assert(!fits_gda_budget(/*ctx=*/4, /*rails=*/2, /*n_signals=*/113),
               "the observed ENOMEM config (4 contexts, pre-compaction 113 signals) must not fit");
+static_assert(shared_total_signals(2, 4) == 2 * 4 + 32, "2 nodes x 4 ctx: 40 signals");
+static_assert(fits_gda_budget(/*ctx=*/5, /*rails=*/2, shared_total_signals(2, 4)),
+              "shared-signal mode: 4 data ctx (+1 reserved) fit at 2 nodes");
 static_assert(max_contexts_for(/*rails=*/2, total_signals(2, 16)) >= 2,
               "at the compacted 2-node namespace at least 2 contexts must fit");
 

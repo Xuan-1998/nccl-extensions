@@ -989,6 +989,8 @@ template <typename TOKEN_DATA_TYPE>
     kp.max_recv_tokens_per_rank = params.max_recv_tokens_per_rank;
     kp.unordered_fabric = params.unordered_fabric;
     kp.dispatch_subputs = params.dispatch_subputs;
+    kp.shared_signals = params.shared_signals;
+    kp.dispatch_edge_totals = params.dispatch_edge_totals;
 
     // Pass device communicators and windows
     kp.dcomm = params.dcomm;
@@ -1007,6 +1009,7 @@ template <typename TOKEN_DATA_TYPE>
         .gin_send_staging_offset = params.mr_info.gin_send_staging_offset,
         .gin_recv_staging_offset = params.mr_info.gin_recv_staging_offset,
         .guard_offset = params.mr_info.guard_offset,
+        .dispatch_header_offset = params.mr_info.dispatch_header_offset,
         .bytes_per_entry = params.mr_info.bytes_per_entry,
         .max_tokens_per_dest = params.mr_info.max_tokens_per_dest,
         // Streaming signal parameters
@@ -1309,6 +1312,8 @@ ncclResult_t call_dispatch(
     kp.guard_enabled = params.guard_enabled;
     kp.unordered_fabric = params.unordered_fabric;
     kp.combine_sent_totals = params.combine_sent_totals;
+    kp.shared_signals = params.shared_signals;
+    kp.combine_edge_totals = params.combine_edge_totals;
 
     // Runtime config
     kp.local_rank = params.local_rank;

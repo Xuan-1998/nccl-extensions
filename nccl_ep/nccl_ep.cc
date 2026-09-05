@@ -751,6 +751,7 @@ struct ncclEpGroup {
         size_t dispatch_guard_offset = 0;
         size_t combine_guard_offset = 0;
         size_t combine_header_offset = 0; // unordered-fabric combine headers (HT-3)
+        size_t dispatch_header_offset = 0; // shared-signal dispatch headers
 
         unsigned signals_tail_base = 0;         // Base signal ID for tail tracking (sender -> receiver)
         int num_max_rdma_chunked_send_tokens = NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE;
@@ -886,6 +887,10 @@ struct ncclEpGroup {
         // Sender-side cumulative combine signal totals (unordered-fabric mode),
         // [(rdma_team_size-1) * max_chunks] uint64, own allocation.
         uint64_t* dev_combine_sent_totals = nullptr;
+        // Shared-signal mode: per (edge, ctx-slot) cumulative totals, atomically
+        // bumped by the senders of each direction. Own allocation.
+        uint64_t* dev_dispatch_edge_totals = nullptr;
+        uint64_t* dev_combine_edge_totals = nullptr;
     } ht_buffers;
 
     // HT eager recv sizing (config.max_recv_tokens_per_rank == NCCL_EP_AUTO):
@@ -1421,6 +1426,9 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // mirroring the compact combine signal namespace.
     size_t combine_header_sz = align_size(
         static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t), GIN_ALIGNMENT);
+    // Shared-signal dispatch header slots: [src_remote][chunk] uint64 (only
+    // consumed when NCCL_EP_SHARED_SIGNALS is on; cheap enough to always carve).
+    size_t dispatch_header_sz = combine_header_sz;
 
     size_t total_gin_buffer_size = 0;
     total_gin_buffer_size += combine_gin_RED_tokens_sz;
@@ -1434,6 +1442,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     total_gin_buffer_size += rdma_send_staging_sz;
     total_gin_buffer_size += rdma_recv_packed_sz;
     total_gin_buffer_size += combine_header_sz;
+    total_gin_buffer_size += dispatch_header_sz;
 
     NCCLCHECK(ncclMemAlloc(&ep_group->gin_config.gin_base_ptr, total_gin_buffer_size));
 
@@ -1480,6 +1489,9 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // Unordered-fabric combine header slots (HT-3): zeroed once at bootstrap.
     CUDACHECK_RET(cudaMemset(ptr + offset, 0, combine_header_sz));
     offset += combine_header_sz;
+    // Shared-signal dispatch header slots: zeroed once at bootstrap.
+    CUDACHECK_RET(cudaMemset(ptr + offset, 0, dispatch_header_sz));
+    offset += dispatch_header_sz;
 
     // Calculate offsets for kernel mr_info
     size_t cur_offset = 0;
@@ -1518,6 +1530,9 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // mirroring the combine signal namespace (see ht_ep.cuh).
     ep_group->gin_config.combine_header_offset = cur_offset;
     cur_offset += combine_header_sz;
+
+    ep_group->gin_config.dispatch_header_offset = cur_offset;
+    cur_offset += dispatch_header_sz;
 
     // =========================================================================
     // Phase 2: configure cross-LSA-team GIN resources
@@ -1564,7 +1579,10 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // worst case (all contexts on one NIC) and print the 2-rail number too.
     {
         namespace gb = nccl_ep::gin_budget;
-        const int n_signals = nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
+        const int n_signals = (nccl_ep_env_flag_on(ep_group->env.shared_signals) &&
+                               nccl_ep_env_flag_on(ep_group->env.unordered_fabric))
+            ? nccl_ep::gin_budget::shared_total_signals(rdma_team_size, qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS)
+            : nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
         if (!gb::fits_gda_budget(qps_per_rank, /*num_rails=*/1, n_signals) && ep_group->rank == 0) {
             fprintf(stderr,
                     "[HT GIN] budget note: %d contexts x %d signals costs %d counters/NIC on 1 rail "
@@ -1580,12 +1598,26 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         }
     }
 
-    ep_group->gin_config.num_total_signals =
-        nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
-    ep_group->gin_config.signals_base = 0;
-    ep_group->gin_config.combine_signal_offset = nccl_ep::gin_budget::combine_signal_offset();
-    ep_group->gin_config.signals_tail_base =
-        nccl_ep::gin_budget::dispatch_tail_base(rdma_team_size, max_chunks_per_rank);
+    const bool shared_signals_on = nccl_ep_env_flag_on(ep_group->env.shared_signals) &&
+                                   nccl_ep_env_flag_on(ep_group->env.unordered_fabric);
+    if (shared_signals_on) {
+        // Shared-signal mode: signals per (edge, ctx-slot); count decoupled from
+        // chunk count (see nccl_ep_gin_budget.h).
+        const int data_ctx = ep_group->gin_config.num_ctx_per_comm;
+        ep_group->gin_config.num_total_signals =
+            nccl_ep::gin_budget::shared_total_signals(rdma_team_size, data_ctx);
+        ep_group->gin_config.signals_base = 0;
+        ep_group->gin_config.combine_signal_offset = nccl_ep::gin_budget::shared_combine_signal_offset();
+        ep_group->gin_config.signals_tail_base =
+            nccl_ep::gin_budget::shared_dispatch_tail_base(rdma_team_size, data_ctx);
+    } else {
+        ep_group->gin_config.num_total_signals =
+            nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
+        ep_group->gin_config.signals_base = 0;
+        ep_group->gin_config.combine_signal_offset = nccl_ep::gin_budget::combine_signal_offset();
+        ep_group->gin_config.signals_tail_base =
+            nccl_ep::gin_budget::dispatch_tail_base(rdma_team_size, max_chunks_per_rank);
+    }
 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)
@@ -1653,6 +1685,20 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->ht_buffers.dev_combine_sent_totals = reinterpret_cast<uint64_t*>(totals);
     }
 
+    // Shared-signal mode: per (edge, ctx-slot) atomic totals for both directions.
+    {
+        const size_t slot_totals_bytes = static_cast<size_t>(rdma_team_size - 1) *
+            static_cast<size_t>(ep_group->gin_config.num_ctx_per_comm) * sizeof(uint64_t);
+        void* dt = nullptr;
+        CUDACHECK_RET(cudaMalloc(&dt, slot_totals_bytes));
+        CUDACHECK_RET(cudaMemset(dt, 0, slot_totals_bytes));
+        ep_group->ht_buffers.dev_dispatch_edge_totals = reinterpret_cast<uint64_t*>(dt);
+        void* ct = nullptr;
+        CUDACHECK_RET(cudaMalloc(&ct, slot_totals_bytes));
+        CUDACHECK_RET(cudaMemset(ct, 0, slot_totals_bytes));
+        ep_group->ht_buffers.dev_combine_edge_totals = reinterpret_cast<uint64_t*>(ct);
+    }
+
     ep_group->ht_buffers.internode_initialized = true;
     return ncclSuccess;
 }
@@ -1682,6 +1728,14 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
     if (ep_group->ht_buffers.dev_combine_sent_totals != nullptr) {
         cudaFree(ep_group->ht_buffers.dev_combine_sent_totals);
         ep_group->ht_buffers.dev_combine_sent_totals = nullptr;
+    }
+    if (ep_group->ht_buffers.dev_dispatch_edge_totals != nullptr) {
+        cudaFree(ep_group->ht_buffers.dev_dispatch_edge_totals);
+        ep_group->ht_buffers.dev_dispatch_edge_totals = nullptr;
+    }
+    if (ep_group->ht_buffers.dev_combine_edge_totals != nullptr) {
+        cudaFree(ep_group->ht_buffers.dev_combine_edge_totals);
+        ep_group->ht_buffers.dev_combine_edge_totals = nullptr;
     }
 
     // Deregister the window
@@ -4266,6 +4320,8 @@ ncclResult_t ncclEpDispatch(
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
         params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
         params.unordered_fabric = nccl_ep_env_flag_on(group->env.unordered_fabric);
+        params.shared_signals = params.unordered_fabric && nccl_ep_env_flag_on(group->env.shared_signals);
+        params.dispatch_edge_totals = group->ht_buffers.dev_dispatch_edge_totals;
         // Weak signals per (chunk, edge) per round; >1 only in unordered mode.
         params.dispatch_subputs = 1;
         if (params.unordered_fabric && group->env.dispatch_subputs.is_set &&
@@ -4305,6 +4361,8 @@ ncclResult_t ncclEpDispatch(
         }
         params.mr_info.gin_send_staging_offset =
             is_lsa_only ? 0 : group->gin_config.gin_send_staging_offset;
+        params.mr_info.dispatch_header_offset =
+            is_lsa_only ? 0 : group->gin_config.dispatch_header_offset;
         params.mr_info.gin_recv_staging_offset =
             is_lsa_only ? 0 : group->gin_config.gin_recv_staging_offset;
         params.mr_info.guard_offset = is_lsa_only ? 0 : group->gin_config.dispatch_guard_offset;
@@ -5354,6 +5412,8 @@ ncclResult_t ncclEpCombine(
             params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
             params.unordered_fabric = nccl_ep_env_flag_on(group->env.unordered_fabric);
             params.combine_sent_totals = group->ht_buffers.dev_combine_sent_totals;
+        params.shared_signals = params.unordered_fabric && nccl_ep_env_flag_on(group->env.shared_signals);
+        params.combine_edge_totals = group->ht_buffers.dev_combine_edge_totals;
             const ncclWindow_t combine_token_window =
                 !combine_x_uses_external_window ? x->win_hdl : group->gin_config.nccl_window;
             const size_t combine_token_offset =

@@ -55,6 +55,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->ht_unfused_sync);
     parse_flag(cfg->disable_guard);
     parse_flag(cfg->unordered_fabric);
+    parse_flag(cfg->shared_signals);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
@@ -84,6 +85,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.ht_unfused_sync,
         &cfg.disable_guard,
         &cfg.unordered_fabric,
+        &cfg.shared_signals,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,
         &cfg.shuffle_sms,
