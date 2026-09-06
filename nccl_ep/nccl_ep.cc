@@ -1562,20 +1562,22 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // createContext; compute the cost here and say what to change instead.
     // Rail count is not knowable portably at this layer, so warn for the
     // worst case (all contexts on one NIC) and print the 2-rail number too.
+    bool gin_over_budget_worst_case = false;
     {
         namespace gb = nccl_ep::gin_budget;
-        const int n_signals = nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
-        if (!gb::fits_gda_budget(qps_per_rank, /*num_rails=*/1, n_signals) && ep_group->rank == 0) {
+        const int n_signals = gb::total_signals(rdma_team_size, max_chunks_per_rank);
+        gin_over_budget_worst_case = !gb::fits_gda_budget(qps_per_rank, /*num_rails=*/1, n_signals);
+        if (gin_over_budget_worst_case && ep_group->rank == 0) {
             fprintf(stderr,
-                    "[HT GIN] budget note: %d contexts x %d signals costs %d counters/NIC on 1 rail "
-                    "(%d on 2 rails) against ~%d; on EFA GDA an over-budget request fails as "
-                    "fi_enable ENOMEM in createContext. Largest context count that fits at this "
-                    "signal count: %d (2 rails). Reduce NCCL_EP_QPS_PER_RANK or chunk count "
-                    "(NCCL_EP_TOKENS_PER_CHUNK).\n",
+                    "[HT GIN] budget note: %d contexts x %d signals costs %d QPs on the busiest NIC "
+                    "on 1 rail (%d on 2 rails) against ~%d usable; on EFA GDA an over-budget request "
+                    "fails as ibv_create_qp ENOMEM inside createContext. Largest context count that "
+                    "fits at this signal count: %d (2 rails). Reduce NCCL_EP_QPS_PER_RANK or raise "
+                    "NCCL_EP_TOKENS_PER_CHUNK (fewer chunks -> fewer signals).\n",
                     qps_per_rank, n_signals,
-                    gb::counters_per_nic(qps_per_rank, 1, n_signals),
-                    gb::counters_per_nic(qps_per_rank, 2, n_signals),
-                    gb::kCountersPerNicBudget,
+                    gb::qps_per_nic(qps_per_rank, 1, n_signals),
+                    gb::qps_per_nic(qps_per_rank, 2, n_signals),
+                    gb::kUsableQpsPerNic,
                     gb::max_contexts_for(2, n_signals));
         }
     }
@@ -1622,7 +1624,23 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             reqs.ginStrongSignalsRequired = false;
             reqs.ginVaSignalsRequired = false;
         }
-        NCCLCHECK(ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]));
+        const ncclResult_t dcc_res = ncclDevCommCreate(ep_group->comm, &reqs, &ep_group->gin_config.dcomms[0]);
+        if (dcc_res != ncclSuccess) {
+            if (gin_over_budget_worst_case) {
+                // The preflight above predicted this: the GIN context/signal request
+                // exceeds the NIC QP pool (surfaces as ibv_create_qp ENOMEM inside
+                // the plugin, then as an opaque internal error here). Report it as
+                // the configuration problem it is instead of propagating NCCL's
+                // "internal error - please report to the NCCL developers".
+                fprintf(stderr,
+                        "[HT GIN] Error: ncclDevCommCreate failed (rank %d) and the GIN request was "
+                        "over the per-NIC QP budget (see the budget note above). Reduce "
+                        "NCCL_EP_QPS_PER_RANK or raise NCCL_EP_TOKENS_PER_CHUNK.\n",
+                        ep_group->rank);
+                return ncclInvalidUsage;
+            }
+            return dcc_res;
+        }
     }
 
     CUDACHECK_RET(cudaMalloc(
