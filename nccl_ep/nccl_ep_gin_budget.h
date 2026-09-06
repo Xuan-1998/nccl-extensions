@@ -17,21 +17,29 @@
 //
 // Why a budget model exists at all: on the EFA GDA backend, an indexed signal
 // is hardware, not software. For every GIN context the plugin creates one
-// data endpoint plus one signal/counter endpoint PER indexed signal, and each
-// signal/counter endpoint holds two hardware counters (FI_WRITE +
-// FI_REMOTE_WRITE). Contexts spread across the GPU's EFA rails
-// (rail = context_id % num_rails). The provider budget is roughly 256 QPs per
-// NIC, and the hardware-counter pool binds at the same scale. A request over
-// budget does not fail with a readable error: fi_enable returns ENOMEM in the
-// middle of createContext. The helpers here compute the per-NIC cost up front
-// so bootstrap can print what actually happened and what to change.
+// data endpoint plus one signal/counter endpoint PER indexed signal; every
+// endpoint is one QP on the NIC. Contexts spread across the GPU's EFA rails
+// (rail = context_id % num_rails). The provider pool is roughly 256 QPs per
+// NIC, and the host-side NCCL comm (net-plugin channels, RMA CE contexts) has
+// already taken a slice of it by the time the GIN contexts are created, so
+// the usable share is modeled as kQpBudgetPerNic - kHostCommQpReserve. A
+// request over budget does not fail with a readable error: ibv_create_qp
+// returns ENOMEM inside fi_enable in the middle of createContext (verified
+// with FI_LOG_LEVEL=warn: "efa_qp_create: ibv_create_qp failed. errno: 12",
+// rl-ep run 56005). The helpers here compute the per-NIC cost up front so
+// bootstrap can print what actually happened and what to change.
 //
-// Empirical calibration on p5en (H200, 2 EFA rails per GPU), 2 nodes x 16
-// chunks (113 signals under the pre-compaction layout):
-//   1 context/NIC x (1 + 2*113) = 227 counters -> fits
-//   2 contexts/NIC x 227        = 454 counters -> ENOMEM
-// which is why the counter pool, not the QP count, is treated as the binding
-// constraint below.
+// Empirical calibration on p5en (H200, 2 EFA rails per GPU), 2-node EP16,
+// QPs on the busiest NIC = ceil(ctx/rails) * (1 + n_signals):
+//   1 ctx/NIC x (1 + 113) = 114 QPs -> fits   (pre-compaction layout)
+//   2 ctx/NIC x (1 +  96) = 194 QPs -> fits   (c256 @ 8192, jobs 55987/55991)
+//   2 ctx/NIC x (1 + 113) = 228 QPs -> ENOMEM (pre-compaction layout)
+//   2 ctx/NIC x (1 + 118) = 238 QPs -> ENOMEM (c192 @ 8192, job 55978/56005)
+// so the QP pool is the binding constraint (an earlier revision blamed the
+// hardware-counter pool; the 194-QP config carries 386 modeled counters and
+// runs fine, which rules counters out). The pass/fail bracket [194, 228]
+// puts the host-comm slice between 28 and 62 QPs; the reserve below is a
+// round number inside that bracket.
 //
 // Signal namespace (per receiving rank). Signals are per-receiving-rank
 // resources, and HT rail communicators pair ranks of equal local rank, so a
@@ -52,8 +60,10 @@ namespace gin_budget {
 
 // ---- provider budget (EFA GDA, empirical; see header comment) --------------
 static constexpr int kQpBudgetPerNic = 256;
-static constexpr int kCountersPerNicBudget = 256;
-static constexpr int kCountersPerScEndpoint = 2; // FI_WRITE + FI_REMOTE_WRITE
+// QPs the host-side NCCL comm already holds on the NIC before GIN contexts
+// are created. Calibrated only to the [194 fits, 228 ENOMEM] bracket above.
+static constexpr int kHostCommQpReserve = 32;
+static constexpr int kUsableQpsPerNic = kQpBudgetPerNic - kHostCommQpReserve;
 
 // Barrier slack kept at the tail of the signal space for NCCL-internal use.
 static constexpr int kBarrierSignalSlack = 32;
@@ -95,24 +105,14 @@ __host__ __device__ constexpr int qps_per_nic(int num_contexts, int num_rails, i
     return contexts_on_busiest_nic(num_contexts, num_rails) * (1 + n_signals);
 }
 
-__host__ __device__ constexpr int counters_per_nic(int num_contexts, int num_rails, int n_signals) {
-    return contexts_on_busiest_nic(num_contexts, num_rails) *
-           (1 + kCountersPerScEndpoint * n_signals);
-}
-
 __host__ __device__ constexpr bool fits_gda_budget(int num_contexts, int num_rails, int n_signals) {
-    return qps_per_nic(num_contexts, num_rails, n_signals) <= kQpBudgetPerNic &&
-           counters_per_nic(num_contexts, num_rails, n_signals) <= kCountersPerNicBudget;
+    return qps_per_nic(num_contexts, num_rails, n_signals) <= kUsableQpsPerNic;
 }
 
-// Largest context count that fits the GDA budget for a given signal count.
-// Counters bind before QPs whenever kCountersPerScEndpoint > 1, so this is
-// effectively rails * floor(budget / (1 + 2 * n_signals)).
+// Largest context count that fits the GDA budget for a given signal count:
+// rails * floor(usable / (1 + n_signals)).
 __host__ __device__ constexpr int max_contexts_for(int num_rails, int n_signals) {
-    const int per_nic_by_counters = kCountersPerNicBudget / (1 + kCountersPerScEndpoint * n_signals);
-    const int per_nic_by_qps = kQpBudgetPerNic / (1 + n_signals);
-    const int per_nic = per_nic_by_counters < per_nic_by_qps ? per_nic_by_counters : per_nic_by_qps;
-    return per_nic * num_rails;
+    return (kUsableQpsPerNic / (1 + n_signals)) * num_rails;
 }
 
 // Calibration anchors: the shapes measured on p5en (2 rails).
@@ -120,6 +120,10 @@ static_assert(fits_gda_budget(/*ctx=*/2, /*rails=*/2, total_signals(2, 16)),
               "the validated p5en config (2 contexts, 64 signals) must fit");
 static_assert(!fits_gda_budget(/*ctx=*/4, /*rails=*/2, /*n_signals=*/113),
               "the observed ENOMEM config (4 contexts, pre-compaction 113 signals) must not fit");
+static_assert(fits_gda_budget(/*ctx=*/3, /*rails=*/2, total_signals(2, 32)),
+              "c256 @ 8192 (3 contexts, 96 signals, 194 QPs busiest NIC) measured fine (jobs 55987/55991)");
+static_assert(!fits_gda_budget(/*ctx=*/3, /*rails=*/2, total_signals(2, 43)),
+              "c192 @ 8192 (3 contexts, 118 signals, 238 QPs busiest NIC) hit ibv_create_qp ENOMEM (jobs 55978/56005)");
 static_assert(max_contexts_for(/*rails=*/2, total_signals(2, 16)) >= 2,
               "at the compacted 2-node namespace at least 2 contexts must fit");
 
