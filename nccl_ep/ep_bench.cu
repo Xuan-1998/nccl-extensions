@@ -3809,45 +3809,45 @@ LowLatencyBytes calculateLowLatencyBytes(
 // Six bandwidth metrics for High Throughput mode, all dividing by measured time t:
 //
 //  Send-side (this rank dispatching tokens to experts):
-//   total_send  = total_send_bytes / t   — all destinations (NVL+RDMA)
-//   nvl_send    = nvl_send_bytes / t     — local node only (NVLink)
-//   rdma_send   = rdma_send_bytes / t    — remote nodes only (RDMA outbound)
+//   total_send     — all destinations, counted per destination rank
+//   nvl_send       — local node only (NVLink)
+//   scale_out_send — counted per destination node; only NIC traffic under --ignore-local-traffic,
+//                    otherwise it also includes tokens whose destination is this same node
 //
 //  Recv-side (this rank's experts receiving tokens):
-//   total_recv  = total_recv_bytes / t   — all sources (NVL+RDMA)
-//   nvl_recv    = nvl_recv_bytes / t     — from local ranks (NVLink)
-//   rdma_recv   = rdma_recv_bytes / t    — from remote ranks (RDMA inbound)
+//   total_recv     — all sources
+//   nvl_recv       — from local ranks (NVLink)
+//   scale_out_recv — arrivals over the NIC (from this rank's peer on each other node)
 //
-//  Derived: nvl_send = total_send - rdma_send
-//           nvl_recv = total_recv - rdma_recv
+//  Derived: nvl_send = total_send - scale_out_send
+//           nvl_recv = total_recv - scale_out_recv
 struct HighThroughputBytes {
-    size_t total_send_bytes;     // NVL + RDMA outbound
-    size_t rdma_send_bytes;      // RDMA outbound only
-    size_t total_recv_bytes;     // NVL + RDMA inbound
-    size_t rdma_recv_bytes;      // RDMA inbound only (from remote ranks)
+    size_t total_send_bytes;          // all destinations, per destination rank
+    size_t scale_out_send_bytes;      // per destination node
+    size_t total_recv_bytes;          // all sources
+    size_t scale_out_recv_bytes;      // arrivals over the NIC
     unsigned int total_send_tokens;
-    unsigned int rdma_send_tokens;
-    unsigned int rdma_recv_tokens;
+    unsigned int scale_out_send_tokens;
+    unsigned int scale_out_recv_tokens;
     unsigned int total_recv_tokens;
 };
 
 // Calculate all six byte metrics from topk_idx for High Throughput mode.
 //
-// Send side: count unique (token, target_rank) pairs this rank sends to.
-// NCCL EP sends a token to each target rank individually (intra-node over NVLink
-// P2P), so a token routed to several ranks -- even ranks on the same node -- is
-// counted once per rank. The implied NVLink send count (total_send - rdma_send)
-// is therefore the count of intra-node per-rank sends.
-//   total_send_tokens = all target ranks (local node via NVLink + remote nodes)
-//   rdma_send_tokens  = target ranks on remote nodes only
+// Send side: a token routed to several ranks is one send per rank, since each rank gets its own
+// NVLink copy. Scale-out is counted per destination node instead: one put carries the row and
+// the destination node fans it out locally.
+//   total_send_tokens     = every target rank
+//   scale_out_send_tokens = every target node (this node included unless --ignore-local-traffic)
 //
 // Recv side: simulate all source ranks' randperm routing (deterministic from
 // seed = src_rank + 42) to count unique (src_rank, token) pairs where at least
 // one selected expert belongs to myRank. myRank is a single rank, so each such
 // pair is one received token regardless of how many local experts it targets --
 // this is already per-(source-rank) accounting.
-//   total_recv_tokens = all source ranks (NVL + RDMA)
-//   rdma_recv_tokens = remote source ranks only
+//   total_recv_tokens     = all source ranks
+//   scale_out_recv_tokens = per token arriving over the NIC, i.e. from the one peer per other
+//                           node that shares this rank's index
 HighThroughputBytes calculateHighThroughputBytes(
     const int64_t* topk_idx_host,
     unsigned int num_tokens,
@@ -3860,19 +3860,19 @@ HighThroughputBytes calculateHighThroughputBytes(
     ncclEpDispQuant_t dispatch_quantization,
     int lsa_team_size,
     ncclDataType_t token_dtype,
-    ncclDataType_t scales_forward_token_dtype) {
+    ncclDataType_t scales_forward_token_dtype,
+    bool ignore_local_traffic) {
     HighThroughputBytes bytes = {0, 0, 0, 0, 0, 0, 0, 0};
 
     int local_node = myRank / lsa_team_size;
     unsigned int num_experts_per_rank = num_experts / static_cast<unsigned int>(nRanks);
 
-    // Send side: count unique (token, target_rank) pairs from this rank's topk_idx.
-    // NCCL EP sends a token to each target rank individually via NVLink P2P, so two
-    // experts that share the same node but live on different ranks are two distinct
-    // sends. Deduplicate per rank (not per node) so intra-node fan-out is counted
-    // correctly; a send is classified RDMA when the target rank is on a remote node.
+    // Send side: count a token once per unique destination rank for NVLink, and once per
+    // unique destination node for scale-out -- one put carries the row and the destination
+    // node fans it out locally. The local node counts unless --ignore-local-traffic is passed.
     for (unsigned int t = 0; t < num_tokens; t++) {
         std::set<int> ranks_for_token;
+        std::set<int> nodes_for_token;
         for (unsigned int k = 0; k < top_k; k++) {
             int64_t expert_id = topk_idx_host[t * top_k + k];
             if (expert_id < 0) continue;
@@ -3880,8 +3880,9 @@ HighThroughputBytes calculateHighThroughputBytes(
             if (ranks_for_token.insert(target_rank).second) {
                 bytes.total_send_tokens++;
                 int target_node = target_rank / lsa_team_size;
-                if (target_node != local_node)
-                    bytes.rdma_send_tokens++;
+                if (ignore_local_traffic && target_node == local_node) continue;
+                if (nodes_for_token.insert(target_node).second)
+                    bytes.scale_out_send_tokens++;
             }
         }
     }
@@ -3892,22 +3893,30 @@ HighThroughputBytes calculateHighThroughputBytes(
     // Each (src_rank, token) pair is counted once regardless of how many experts on myRank it targets.
     std::vector<int64_t> src_perm(num_experts);
     for (int src_rank = 0; src_rank < nRanks; src_rank++) {
-        int src_node = src_rank / lsa_team_size;
-        bool is_rdma = (src_node != local_node);
+        // A rank only ever receives over the NIC from the one rank sharing its index on each
+        // other node; everything else arrives over NVLink from that landing rank. Count once
+        // per token such a peer sends to this node -- including tokens this rank does not
+        // itself consume, since the landing rank receives the row on the node's behalf. This
+        // rank itself is included unless --ignore-local-traffic, mirroring the self entry on
+        // the send side so both directions stay comparable in either mode.
+        const bool is_rail_member =
+            (src_rank % lsa_team_size == myRank % lsa_team_size) &&
+            (!ignore_local_traffic || src_rank != myRank);
         unsigned int src_tokens = num_tokens_per_rank[src_rank];
 
         std::mt19937 src_gen(src_rank + 42);
         std::iota(src_perm.begin(), src_perm.end(), 0);
         for (unsigned int t = 0; t < src_tokens; t++) {
             std::shuffle(src_perm.begin(), src_perm.end(), src_gen);
+            bool targets_me = false;
+            bool targets_my_node = false;
             for (unsigned int k = 0; k < top_k; k++) {
                 int target_rank = static_cast<int>(src_perm[k] / num_experts_per_rank);
-                if (target_rank == myRank) {
-                    bytes.total_recv_tokens++;
-                    if (is_rdma) bytes.rdma_recv_tokens++;
-                    break;
-                }
+                if (target_rank == myRank) targets_me = true;
+                if (target_rank / lsa_team_size == local_node) targets_my_node = true;
             }
+            if (targets_me) bytes.total_recv_tokens++;
+            if (is_rail_member && targets_my_node) bytes.scale_out_recv_tokens++;
         }
     }
 
@@ -3931,9 +3940,9 @@ HighThroughputBytes calculateHighThroughputBytes(
     }
 
     bytes.total_send_bytes = bytes.total_send_tokens * bytes_per_token;
-    bytes.rdma_send_bytes = bytes.rdma_send_tokens * bytes_per_token;
+    bytes.scale_out_send_bytes = bytes.scale_out_send_tokens * bytes_per_token;
     bytes.total_recv_bytes = bytes.total_recv_tokens * bytes_per_token;
-    bytes.rdma_recv_bytes = bytes.rdma_recv_tokens * bytes_per_token;
+    bytes.scale_out_recv_bytes = bytes.scale_out_recv_tokens * bytes_per_token;
 
     return bytes;
 }
@@ -4213,9 +4222,9 @@ void printHighThroughputResults(
     KernelTimer& ktimer,
     const HighThroughputBytes& ht_bytes,
     size_t global_total_send,
-    size_t global_rdma_send,
+    size_t global_scale_out_send,
     size_t global_total_recv,
-    size_t global_rdma_recv,
+    size_t global_scale_out_recv,
     ncclEpDispQuant_t dispatch_quantization,
     bool dispatch_only,
     bool report_bandwidth = true) {
@@ -4301,11 +4310,11 @@ void printHighThroughputResults(
         global_total_avg /= nRanks;
 
         double avg_total_send = static_cast<double>(global_total_send) / nRanks;
-        double avg_rdma_send = static_cast<double>(global_rdma_send) / nRanks;
+        double avg_scale_out_send = static_cast<double>(global_scale_out_send) / nRanks;
         double avg_total_recv = static_cast<double>(global_total_recv) / nRanks;
-        double avg_rdma_recv = static_cast<double>(global_rdma_recv) / nRanks;
-        double avg_nvl_send = avg_total_send - avg_rdma_send;
-        double avg_nvl_recv = avg_total_recv - avg_rdma_recv;
+        double avg_scale_out_recv = static_cast<double>(global_scale_out_recv) / nRanks;
+        double avg_nvl_send = avg_total_send - avg_scale_out_send;
+        double avg_nvl_recv = avg_total_recv - avg_scale_out_recv;
 
         double dk_total_s = global_dispatch_avg * 1e-3;  // avg total dispatch time in seconds
         double ck_total_s = global_combine_avg * 1e-3;
@@ -4319,23 +4328,23 @@ void printHighThroughputResults(
         printf("Dispatch:    total=%.2f us (min=%.2f, max=%.2f)\n", global_dispatch_avg * 1000,
                global_dispatch_min * 1000, global_dispatch_max * 1000);
         if (report_bandwidth && dk_total_s > 0) {
-            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+            printf("             recv: total_bw=%.2f  nvl_bw=%.2f  scale_out_bw=%.2f GB/s\n",
                    (avg_total_recv / 1e9) / dk_total_s, (avg_nvl_recv / 1e9) / dk_total_s,
-                   (avg_rdma_recv / 1e9) / dk_total_s);
-            printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                   (avg_scale_out_recv / 1e9) / dk_total_s);
+            printf("             send: total_bw=%.2f  nvl_bw=%.2f  scale_out_bw=%.2f GB/s\n",
                    (avg_total_send / 1e9) / dk_total_s, (avg_nvl_send / 1e9) / dk_total_s,
-                   (avg_rdma_send / 1e9) / dk_total_s);
+                   (avg_scale_out_send / 1e9) / dk_total_s);
         }
         if (!dispatch_only) {
             printf("Combine:     total=%.2f us (min=%.2f, max=%.2f)\n", global_combine_avg * 1000,
                    global_combine_min * 1000, global_combine_max * 1000);
             if (report_bandwidth && ck_total_s > 0) {
-                printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                printf("             send: total_bw=%.2f  nvl_bw=%.2f  scale_out_bw=%.2f GB/s\n",
                        (avg_total_recv / 1e9) / ck_total_s, (avg_nvl_recv / 1e9) / ck_total_s,
-                       (avg_rdma_recv / 1e9) / ck_total_s);
-                printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                       (avg_scale_out_recv / 1e9) / ck_total_s);
+                printf("             recv: total_bw=%.2f  nvl_bw=%.2f  scale_out_bw=%.2f GB/s\n",
                        (avg_total_send / 1e9) / ck_total_s, (avg_nvl_send / 1e9) / ck_total_s,
-                       (avg_rdma_send / 1e9) / ck_total_s);
+                       (avg_scale_out_send / 1e9) / ck_total_s);
             }
             printf("Total (D+C): avg=%.2f us, min=%.2f us, max=%.2f us\n", global_total_avg * 1000,
                    global_total_min * 1000, global_total_max * 1000);
@@ -4353,12 +4362,12 @@ void printHighThroughputResults(
             double ck_s = avg_kernel_ck_us / 1e6;
             printf("Dispatch:    kernel=%.2f us\n", avg_kernel_dk_us);
             if (report_bandwidth && dk_s > 0) {
-                printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                printf("             recv: total_bw=%.2f  nvl_bw=%.2f  scale_out_bw=%.2f GB/s\n",
                        (avg_total_recv / 1e9) / dk_s, (avg_nvl_recv / 1e9) / dk_s,
-                       (avg_rdma_recv / 1e9) / dk_s);
-                printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                       (avg_scale_out_recv / 1e9) / dk_s);
+                printf("             send: total_bw=%.2f  nvl_bw=%.2f  scale_out_bw=%.2f GB/s\n",
                        (avg_total_send / 1e9) / dk_s, (avg_nvl_send / 1e9) / dk_s,
-                       (avg_rdma_send / 1e9) / dk_s);
+                       (avg_scale_out_send / 1e9) / dk_s);
             }
             if (avg_dispatch_epi_us > 0.0) {
                 printf("DispatchEpilogue: kernel=%.2f us\n", avg_dispatch_epi_us);
@@ -4367,12 +4376,12 @@ void printHighThroughputResults(
             if (!dispatch_only) {
                 printf("Combine:     kernel=%.2f us\n", avg_kernel_ck_us);
                 if (report_bandwidth && ck_s > 0) {
-                    printf("             send: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                    printf("             send: total_bw=%.2f  nvl_bw=%.2f  scale_out_bw=%.2f GB/s\n",
                            (avg_total_recv / 1e9) / ck_s, (avg_nvl_recv / 1e9) / ck_s,
-                           (avg_rdma_recv / 1e9) / ck_s);
-                    printf("             recv: total_bw=%.2f  nvl_bw=%.2f  rdma_bw=%.2f GB/s\n",
+                           (avg_scale_out_recv / 1e9) / ck_s);
+                    printf("             recv: total_bw=%.2f  nvl_bw=%.2f  scale_out_bw=%.2f GB/s\n",
                            (avg_total_send / 1e9) / ck_s, (avg_nvl_send / 1e9) / ck_s,
-                           (avg_rdma_send / 1e9) / ck_s);
+                           (avg_scale_out_send / 1e9) / ck_s);
                 }
                 if (avg_combine_pro_us > 0.0) {
                     printf("CombinePrologue: kernel=%.2f us\n", avg_combine_pro_us);
@@ -4397,14 +4406,14 @@ void printHighThroughputResults(
         if (report_bandwidth) {
             printf(
                 "\nLogical payload bytes (tokens + forwarded scales, per-rank avg): "
-                "total_send=%.2f MB (%u tokens), rdma_send=%.2f MB (%u tokens), "
-                "rdma_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
+                "total_send=%.2f MB (%u tokens), scale_out_send=%.2f MB (%u tokens), "
+                "scale_out_recv=%.2f MB (%u tokens), total_recv=%.2f MB (%u tokens)\n",
                 avg_total_send / 1e6,
                 ht_bytes.total_send_tokens,
-                avg_rdma_send / 1e6,
-                ht_bytes.rdma_send_tokens,
-                avg_rdma_recv / 1e6,
-                ht_bytes.rdma_recv_tokens,
+                avg_scale_out_send / 1e6,
+                ht_bytes.scale_out_send_tokens,
+                avg_scale_out_recv / 1e6,
+                ht_bytes.scale_out_recv_tokens,
                 avg_total_recv / 1e6,
                 ht_bytes.total_recv_tokens);
         }
@@ -4578,7 +4587,10 @@ void printUsage(const char* programName, int myRank) {
         printf(
             "  --max-recv-token-slots-per-rank <N>  Per-rank recv-slot budget\n"
             "                             HT only (0 = auto; HT default: FLAT=nRanks*tokens, Expert-major=nRanks*tokens*top_k).\n"
-            "                             Ignored in LL mode.\n");
+            "                             Ignored in LL mode.\n"
+            "  --ignore-local-traffic     scale_out_send counts only tokens that leave this node,\n"
+            "                             making it true NIC traffic (default: also counts tokens\n"
+            "                             destined for this same node). HT only.\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
         printf("  --max-num-sms <N>       Maximum SMs for EP kernels (0 = auto, default: 0)\n");
         printf("  --shuffle-sms <N> SMs for the token permutation (shuffle) kernels (0 = auto, default: 0)\n");
@@ -4655,6 +4667,7 @@ int main(int argc, char* argv[]) {
     bool include_non_uniform_tokens = false;
     bool topk_idx_int32 = false;  // LL only: pass ncclInt32 topk_idx instead of ncclInt64
     bool em_nvlink_dup = false;       // HT+EM only: force nvlink_dup path (sender duplicates per-expert over NVLink)
+    bool ignore_local_traffic = false;  // HT only: exclude this rank's own node from scale_out_send
     ncclEpDispQuant_t dispatch_quantization = NCCL_EP_DISP_QUANT_NONE;
     ncclEpCombQuant_t combine_quantization = NCCL_EP_COMB_QUANT_NONE;
     // Numbering selector for recv_topk_idx writes (LL rank-major / HT FLAT only).
@@ -4704,6 +4717,7 @@ int main(int argc, char* argv[]) {
         {"expert-id-kind", required_argument, 0, 1000},
         {"datatype", required_argument, 0, 0},
         {"disable-token-dropping", no_argument, 0, 1001},
+        {"ignore-local-traffic", no_argument, 0, 1005},
         {"backward", no_argument, 0, 'B'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -4924,6 +4938,9 @@ int main(int argc, char* argv[]) {
             break;
         case 1001:  // --disable-token-dropping
             g_disable_token_dropping = true;
+            break;
+        case 1005:  // --ignore-local-traffic
+            ignore_local_traffic = true;
             break;
         case 'h':
             printUsage(argv[0], myRank);
@@ -5431,7 +5448,8 @@ int main(int argc, char* argv[]) {
             dispatch_quantization,
             ncclTeamLsa(comm).nRanks,
             token_dtype,
-            scales_forward_token_dtype);
+            scales_forward_token_dtype,
+            ignore_local_traffic);
     }
 
     {
@@ -5552,9 +5570,9 @@ int main(int argc, char* argv[]) {
 
     // HT recv bytes are pre-computed in calculateHighThroughputBytes via routing simulation
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && myRank == 0) {
-        printf("[DEBUG] HT bytes: send=%u tokens, rdma_send=%u, total_recv=%u tokens, rdma_recv=%u (buffer=%u)\n",
-               ht_bytes.total_send_tokens, ht_bytes.rdma_send_tokens, ht_bytes.total_recv_tokens,
-               ht_bytes.rdma_recv_tokens, num_recv_tokens);
+        printf("[DEBUG] HT bytes: send=%u tokens, scale_out_send=%u, total_recv=%u tokens, scale_out_recv=%u (buffer=%u)\n",
+               ht_bytes.total_send_tokens, ht_bytes.scale_out_send_tokens, ht_bytes.total_recv_tokens,
+               ht_bytes.scale_out_recv_tokens, num_recv_tokens);
         fflush(stdout);
     }
 
@@ -5832,7 +5850,7 @@ int main(int argc, char* argv[]) {
         }
     } else {
         // HT mode: RDMA_send + total_recv (matches DeepEP methodology)
-        dispatch_data_bytes = ht_bytes.rdma_send_bytes + ht_bytes.total_recv_bytes;
+        dispatch_data_bytes = ht_bytes.scale_out_send_bytes + ht_bytes.total_recv_bytes;
         combine_data_bytes = dispatch_only ? 0 : dispatch_data_bytes;
     }
 
@@ -5970,13 +5988,13 @@ int main(int argc, char* argv[]) {
     // ktimer.dump(myRank);
 
     // Aggregate byte counts across ranks (HT only)
-    size_t global_total_send = 0, global_rdma_send = 0;
-    size_t global_total_recv = 0, global_rdma_recv = 0;
+    size_t global_total_send = 0, global_scale_out_send = 0;
+    size_t global_total_recv = 0, global_scale_out_recv = 0;
     if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         MPI_Reduce(&ht_bytes.total_send_bytes, &global_total_send, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-        MPI_Reduce(&ht_bytes.rdma_send_bytes, &global_rdma_send, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&ht_bytes.scale_out_send_bytes, &global_scale_out_send, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&ht_bytes.total_recv_bytes, &global_total_recv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-        MPI_Reduce(&ht_bytes.rdma_recv_bytes, &global_rdma_recv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&ht_bytes.scale_out_recv_bytes, &global_scale_out_recv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     }
 
     if (myRank == 0 && algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
@@ -6047,9 +6065,9 @@ int main(int argc, char* argv[]) {
             ktimer,
             ht_bytes,
             global_total_send,
-            global_rdma_send,
+            global_scale_out_send,
             global_total_recv,
-            global_rdma_recv,
+            global_scale_out_recv,
             dispatch_quantization,
             dispatch_only);
     }
@@ -6322,9 +6340,9 @@ int main(int argc, char* argv[]) {
                 ktimer_bwd,
                 ht_bytes,
                 global_total_send,
-                global_rdma_send,
+                global_scale_out_send,
                 global_total_recv,
-                global_rdma_recv,
+                global_scale_out_recv,
                 dispatch_quantization,
                 dispatch_only,
                 /*report_bandwidth=*/false);
