@@ -413,6 +413,11 @@ struct dispatch_memory_region_info_t {
     size_t dispatch_header_offset; // shared-signal dispatch header slots
     size_t bytes_per_entry; // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest; // Max tokens that can be staged per destination
+    // Counted-signal layout (NCCL_EP_COUNTED_SIGNALS); must mirror ht_ep.cuh.
+    size_t counted_slice_stride;
+    size_t counted_chunk_stride;
+    size_t counted_max_chunks;
+    int counted_tokens_per_slice;
     // Streaming RDMA signals
     unsigned signals_tail_base; // Base signal ID for tail tracking (sender -> receiver)
     // Streaming buffer configuration
@@ -495,6 +500,7 @@ struct DispatchParams {
     // when unordered (already normalized host-side).
     int dispatch_subputs = 1;
     bool shared_signals = false; // per (edge, ctx-slot) signals + per-chunk headers
+    bool counted_signals = false; // per-chunk signal shared by sources + in-band sub-put headers
     uint64_t* dispatch_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
 
     // Backstop bound for recv slot indices (see dispatch_kernel_param_base_t).
@@ -588,6 +594,7 @@ struct CombineParams {
     bool unordered_fabric = false; // EFA/SRD-safe HT signaling (NCCL_EP_UNORDERED_FABRIC)
     uint64_t* combine_sent_totals = nullptr; // sender cumulative signal totals (unordered mode)
     bool shared_signals = false; // per (edge, ctx-slot) signals + per-chunk headers
+    bool counted_signals = false; // per-chunk signal shared by sources + in-band sub-put headers
     uint64_t* combine_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
 };
 

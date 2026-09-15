@@ -67,6 +67,10 @@ struct ncclEpEnvConfig {
     // directions. Decouples signal count from chunk count so more GIN contexts
     // fit the EFA GDA endpoint budget. Requires unordered_fabric.
     ncclEpEnvVar shared_signals{"NCCL_EP_SHARED_SIGNALS", ncclEpEnvType::flag};
+    // Counted-signal dispatch (NCCL_EP_COUNTED_SIGNALS, requires unordered_fabric):
+    // one signal per chunk shared by every source; each sub-put carries an in-band
+    // header and the receiver gates on landed >= visible headers (DeepEP-EFA style).
+    ncclEpEnvVar counted_signals{"NCCL_EP_COUNTED_SIGNALS", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar shuffle_sms{"NCCL_EP_SHUFFLE_SMS", ncclEpEnvType::ulong};

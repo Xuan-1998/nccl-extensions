@@ -752,6 +752,11 @@ struct ncclEpGroup {
         size_t combine_guard_offset = 0;
         size_t combine_header_offset = 0; // unordered-fabric combine headers (HT-3)
         size_t dispatch_header_offset = 0; // shared-signal dispatch headers
+        // Counted-signal packed layout (0 when the mode is off).
+        size_t counted_slice_stride = 0;
+        size_t counted_chunk_stride = 0;
+        int counted_tokens_per_slice = 0;
+        int counted_max_chunks = 0;
 
         unsigned signals_tail_base = 0;         // Base signal ID for tail tracking (sender -> receiver)
         int num_max_rdma_chunked_send_tokens = NCCL_EP_HT_DISPATCH_RDMA_BATCH_SIZE;
@@ -1416,12 +1421,28 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     size_t bytes_per_token_entry = ep_group->config.max_token_bytes;
     size_t bytes_per_prob_entry = (ep_group->num_local_experts * lsa_team_size) * sizeof(float);
     size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry;
-    size_t rdma_send_staging_sz = align_size(
-        static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry,
-        GIN_ALIGNMENT);
-    size_t rdma_recv_packed_sz = align_size(
-        static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry,
-        GIN_ALIGNMENT);
+    // Counted-signal layout: per (source slot, chunk) the region is S slices of
+    // [16 B header | tokens_per_slice entries], so the header travels inside the
+    // slice's put. Slightly larger than the flat packed layout (S headers plus up
+    // to S-1 spare entries per chunk).
+    const bool counted_layout = nccl_ep_env_flag_on(ep_group->env.counted_signals) &&
+                                nccl_ep_env_flag_on(ep_group->env.unordered_fabric);
+    int counted_subputs = 1;
+    if (counted_layout && ep_group->env.dispatch_subputs.is_set && ep_group->env.dispatch_subputs.value.ul > 0)
+        counted_subputs = static_cast<int>(ep_group->env.dispatch_subputs.value.ul);
+    const int counted_tokens_per_slice = (ht_tokens_per_chunk + counted_subputs - 1) / counted_subputs;
+    const size_t counted_slice_stride = align_size(
+        NCCL_EP_COUNTED_HDR_BYTES + static_cast<size_t>(counted_tokens_per_slice) * bytes_per_entry, 16);
+    const size_t counted_chunk_stride = static_cast<size_t>(counted_subputs) * counted_slice_stride;
+    const size_t packed_region_sz = counted_layout
+        ? static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * counted_chunk_stride
+        : static_cast<size_t>(rdma_team_size - 1) * ep_group->config.max_dispatch_tokens_per_rank * bytes_per_entry;
+    size_t rdma_send_staging_sz = align_size(packed_region_sz, GIN_ALIGNMENT);
+    size_t rdma_recv_packed_sz = align_size(packed_region_sz, GIN_ALIGNMENT);
+    ep_group->gin_config.counted_slice_stride = counted_layout ? counted_slice_stride : 0;
+    ep_group->gin_config.counted_chunk_stride = counted_layout ? counted_chunk_stride : 0;
+    ep_group->gin_config.counted_tokens_per_slice = counted_layout ? counted_tokens_per_slice : 0;
+    ep_group->gin_config.counted_max_chunks = counted_layout ? max_chunks_per_rank : 0;
     // Unordered-fabric combine header slots (HT-3): [src_remote][chunk] uint64,
     // mirroring the compact combine signal namespace.
     size_t combine_header_sz = align_size(
@@ -1579,8 +1600,10 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // worst case (all contexts on one NIC) and print the 2-rail number too.
     {
         namespace gb = nccl_ep::gin_budget;
-        const int n_signals = (nccl_ep_env_flag_on(ep_group->env.shared_signals) &&
-                               nccl_ep_env_flag_on(ep_group->env.unordered_fabric))
+        const int n_signals = counted_layout
+            ? nccl_ep::gin_budget::counted_total_signals(rdma_team_size, max_chunks_per_rank)
+            : (nccl_ep_env_flag_on(ep_group->env.shared_signals) &&
+               nccl_ep_env_flag_on(ep_group->env.unordered_fabric))
             ? nccl_ep::gin_budget::shared_total_signals(rdma_team_size, qps_per_rank - NCCL_EP_HT_RESERVED_GIN_GPU_CTXS)
             : nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
         if (!gb::fits_gda_budget(qps_per_rank, /*num_rails=*/1, n_signals) && ep_group->rank == 0) {
@@ -1600,7 +1623,20 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
 
     const bool shared_signals_on = nccl_ep_env_flag_on(ep_group->env.shared_signals) &&
                                    nccl_ep_env_flag_on(ep_group->env.unordered_fabric);
-    if (shared_signals_on) {
+    if (counted_layout && shared_signals_on) {
+        fprintf(stderr, "[HT GIN] NCCL_EP_COUNTED_SIGNALS and NCCL_EP_SHARED_SIGNALS are exclusive\n");
+        return ncclInvalidArgument;
+    }
+    if (counted_layout) {
+        // Counted-signal mode: dispatch signals per chunk, shared by every source
+        // (the in-band header names the source); combine unchanged.
+        ep_group->gin_config.num_total_signals =
+            nccl_ep::gin_budget::counted_total_signals(rdma_team_size, max_chunks_per_rank);
+        ep_group->gin_config.signals_base = 0;
+        ep_group->gin_config.combine_signal_offset = nccl_ep::gin_budget::combine_signal_offset();
+        ep_group->gin_config.signals_tail_base =
+            nccl_ep::gin_budget::counted_dispatch_tail_base(rdma_team_size, max_chunks_per_rank);
+    } else if (shared_signals_on) {
         // Shared-signal mode: signals per (edge, ctx-slot); count decoupled from
         // chunk count (see nccl_ep_gin_budget.h).
         const int data_ctx = ep_group->gin_config.num_ctx_per_comm;
@@ -4321,6 +4357,7 @@ ncclResult_t ncclEpDispatch(
         params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
         params.unordered_fabric = nccl_ep_env_flag_on(group->env.unordered_fabric);
         params.shared_signals = params.unordered_fabric && nccl_ep_env_flag_on(group->env.shared_signals);
+        params.counted_signals = params.unordered_fabric && nccl_ep_env_flag_on(group->env.counted_signals);
         params.dispatch_edge_totals = group->ht_buffers.dev_dispatch_edge_totals;
         // Weak signals per (chunk, edge) per round; >1 only in unordered mode.
         params.dispatch_subputs = 1;
@@ -4368,6 +4405,10 @@ ncclResult_t ncclEpDispatch(
         params.mr_info.guard_offset = is_lsa_only ? 0 : group->gin_config.dispatch_guard_offset;
         params.mr_info.bytes_per_entry = bytes_per_entry;
         params.mr_info.max_tokens_per_dest = static_cast<size_t>(group->config.max_dispatch_tokens_per_rank);
+        params.mr_info.counted_slice_stride = is_lsa_only ? 0 : group->gin_config.counted_slice_stride;
+        params.mr_info.counted_chunk_stride = is_lsa_only ? 0 : group->gin_config.counted_chunk_stride;
+        params.mr_info.counted_tokens_per_slice = is_lsa_only ? 0 : group->gin_config.counted_tokens_per_slice;
+        params.mr_info.counted_max_chunks = is_lsa_only ? 0 : static_cast<size_t>(group->gin_config.counted_max_chunks);
         params.mr_info.signals_tail_base =
             is_lsa_only ? 0 : static_cast<unsigned>(group->gin_config.signals_tail_base);
         params.mr_info.num_max_rdma_chunked_send_tokens =

@@ -990,6 +990,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.unordered_fabric = params.unordered_fabric;
     kp.dispatch_subputs = params.dispatch_subputs;
     kp.shared_signals = params.shared_signals;
+    kp.counted_signals = params.counted_signals;
     kp.dispatch_edge_totals = params.dispatch_edge_totals;
 
     // Pass device communicators and windows
@@ -1012,6 +1013,10 @@ template <typename TOKEN_DATA_TYPE>
         .dispatch_header_offset = params.mr_info.dispatch_header_offset,
         .bytes_per_entry = params.mr_info.bytes_per_entry,
         .max_tokens_per_dest = params.mr_info.max_tokens_per_dest,
+        .counted_slice_stride = params.mr_info.counted_slice_stride,
+        .counted_chunk_stride = params.mr_info.counted_chunk_stride,
+        .counted_max_chunks = params.mr_info.counted_max_chunks,
+        .counted_tokens_per_slice = params.mr_info.counted_tokens_per_slice,
         // Streaming signal parameters
         .signals_tail_base = params.mr_info.signals_tail_base,
         .num_max_rdma_chunked_send_tokens = params.mr_info.num_max_rdma_chunked_send_tokens

@@ -153,6 +153,13 @@ struct dispatch_memory_region_info_t {
     size_t dispatch_header_offset; // shared-signal dispatch header slots
     size_t bytes_per_entry; // Size of packed entry (token + prob + sf)
     size_t max_tokens_per_dest; // Max tokens that can be staged per destination
+    // Counted-signal layout (NCCL_EP_COUNTED_SIGNALS): per (source slot, chunk) the
+    // send staging and packed receive regions hold S slices of
+    // [NCCL_EP_COUNTED_HDR_BYTES header | tokens_per_slice entries]. 0 when off.
+    size_t counted_slice_stride;
+    size_t counted_chunk_stride;
+    size_t counted_max_chunks;
+    int counted_tokens_per_slice;
     // Streaming RDMA signals
     unsigned signals_tail_base; // Base signal ID for tail tracking (sender -> receiver)
     // Streaming buffer configuration
@@ -197,6 +204,39 @@ dispatch_packed_entry_offset(const dispatch_memory_region_info_t* mr, int remote
            (static_cast<size_t>(remote_slot) * mr->max_tokens_per_dest +
             static_cast<size_t>(chunk_first_token)) *
                mr->bytes_per_entry;
+}
+
+// ---- Counted-signal dispatch (NCCL_EP_COUNTED_SIGNALS) --------------------------
+// One dispatch signal per chunk, shared by every source; the source is named by the
+// in-band header at the head of each sub-put. The receiver gates a chunk on
+// landed(chunk) >= visible headers of this round: every completed put has a visible
+// header, so equality means no visible header still has a body in flight. Sound on
+// unordered fabrics with weak signals; no per-source signal, no lockstep.
+#ifndef NCCL_EP_COUNTED_HDR_BYTES
+#define NCCL_EP_COUNTED_HDR_BYTES 16
+#endif
+static constexpr uint64_t kCountedHdrWrittenBit = 1ull << 63;
+
+__host__ __device__ __forceinline__ uint64_t counted_pack_header(uint32_t round, uint32_t count, bool more) {
+    return kCountedHdrWrittenBit | (static_cast<uint64_t>(round & 0x7fffffffu) << 32) |
+           (static_cast<uint64_t>(count & 0x3fffffffu) << 1) | (more ? 1ull : 0ull);
+}
+__host__ __device__ __forceinline__ bool counted_header_valid(uint64_t hdr, uint32_t round) {
+    return (hdr & kCountedHdrWrittenBit) != 0 && static_cast<uint32_t>((hdr >> 32) & 0x7fffffffu) == (round & 0x7fffffffu);
+}
+__host__ __device__ __forceinline__ uint32_t counted_header_count(uint64_t hdr) {
+    return static_cast<uint32_t>((hdr >> 1) & 0x3fffffffu);
+}
+__forceinline__ __device__ unsigned counted_dispatch_signal_id(unsigned signals_tail_base, int cidx) {
+    return signals_tail_base + static_cast<unsigned>(cidx);
+}
+// Byte offset (from gin_base_ptr) of slice s of chunk cidx from source slot remote_slot,
+// in either the send staging or the packed receive region (same layout in both).
+__forceinline__ __device__ size_t counted_slice_offset(
+    const dispatch_memory_region_info_t* mr, size_t region_offset, int remote_slot, int cidx, int s) {
+    return region_offset +
+           (static_cast<size_t>(remote_slot) * mr->counted_max_chunks + static_cast<size_t>(cidx)) * mr->counted_chunk_stride +
+           static_cast<size_t>(s) * mr->counted_slice_stride;
 }
 
 struct combine_memory_region_info_t {
@@ -1073,6 +1113,8 @@ struct dispatch_kernel_param_base_t {
     // Shared-signal mode (NCCL_EP_SHARED_SIGNALS): see shared_edge_signal_id.
     bool shared_signals;
     uint64_t* dispatch_edge_totals; // per (edge, ctx-slot) atomic totals
+    // Counted-signal mode (NCCL_EP_COUNTED_SIGNALS): see counted_pack_header.
+    bool counted_signals;
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     dispatch_warp_timing_entry_t* warp_timing;
 #endif
@@ -1269,6 +1311,10 @@ template <typename TOKEN_DATA_TYPE>
 struct g2s_source_t {
     bool use_packed;
     const uint8_t* packed_base;
+    // Counted-signal layout: entries live in slices of tokens_per_slice, each
+    // preceded by a header; 0 means the flat packed layout.
+    int tokens_per_slice;
+    size_t slice_stride;
     const TOKEN_DATA_TYPE* token_base;
     const float* prob_base;
     const uint8_t* sf_base;
@@ -1295,6 +1341,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const uint64_t expected_flag_value,
     const int dispatch_subputs,
     const bool shared_signals,
+    const bool counted_signals,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int experts_per_rank,
@@ -1305,6 +1352,8 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     g2s_source_t<TOKEN_DATA_TYPE> src;
     src.use_packed = false;
     src.packed_base = nullptr;
+    src.tokens_per_slice = 0;
+    src.slice_stride = 0;
     src.token_base = nullptr;
     src.prob_base = nullptr;
     src.sf_base = nullptr;
@@ -1330,7 +1379,46 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
         const auto g2s_ctx_sharing = (NBLOCKS * N2N_WARPS <= num_ctx_per_comm)
             ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
         ncclGin net(dcomm, ctx_idx, g2s_ctx_sharing);
-        if (shared_signals) {
+        if (counted_signals) {
+            // Counted-signal mode. Every source sends dispatch_subputs puts per chunk per
+            // round, each headed by counted_pack_header(round, count, more) and carrying a
+            // weak +1 on the chunk's shared signal. All rounds before this one are fully
+            // landed (the receiver consumed them), so the counter holds
+            // (round-1) * sources * subputs plus this round's completed puts. A completed
+            // put has a visible header, so
+            //   counter <= (round-1) * sources * subputs + visible_headers(round)
+            // always, and equality means every visible header's body has landed. We
+            // wait for our own subputs headers to be visible and for that equality.
+            constexpr int NUM_SOURCES = LSA_TEAMS - 1;
+            const int my_slot = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
+            const unsigned sig = counted_dispatch_signal_id(mr_info->signals_tail_base, cidx);
+            const uint32_t round = static_cast<uint32_t>(expected_flag_value);
+            const uint64_t prev_rounds =
+                (expected_flag_value - 1ull) * static_cast<uint64_t>(NUM_SOURCES) * static_cast<uint64_t>(dispatch_subputs);
+            const uint8_t* base = static_cast<const uint8_t*>(gin_base_ptr);
+            for (;;) {
+                int my_valid = 0, num_valid = 0;
+                for (int slot = 0; slot < NUM_SOURCES; ++slot) {
+                    for (int sp = 0; sp < dispatch_subputs; ++sp) {
+                        const uint64_t hdr = nccl_ep::ld_relaxed_sys_global(reinterpret_cast<const uint64_t*>(
+                            base + counted_slice_offset(mr_info, mr_info->gin_recv_staging_offset, slot, cidx, sp)));
+                        if (counted_header_valid(hdr, round)) {
+                            ++num_valid;
+                            if (slot == my_slot) ++my_valid;
+                        }
+                    }
+                }
+                if (my_valid == dispatch_subputs &&
+                    net.readSignal(sig) >= prev_rounds + static_cast<uint64_t>(num_valid)) {
+                    break;
+                }
+            }
+            src.use_packed = true;
+            src.tokens_per_slice = mr_info->counted_tokens_per_slice;
+            src.slice_stride = mr_info->counted_slice_stride;
+            src.packed_base = base + counted_slice_offset(mr_info, mr_info->gin_recv_staging_offset, my_slot, cidx, 0);
+            return src;
+        } else if (shared_signals) {
             // Shared-signal mode: poll this chunk's header for the round tag, read
             // the slot-cumulative total, and wait the (edge, ctx-slot) signal to
             // that absolute total. The signal is monotonic and addition commutes,
@@ -1468,8 +1556,13 @@ __forceinline__ __device__ void dispatch_g2s_issue_token(
     uint32_t tx_bytes;
 
     if (src.use_packed) {
-        // Packed entry is contiguous [token | prob | sf].
-        const uint8_t* packed_src_base = src.packed_base + packed_dense_idx * mr_info->bytes_per_entry;
+        // Packed entry is contiguous [token | prob | sf]. In the counted-signal layout
+        // entries sit after a header inside their slice, and packed_dense_idx is dense
+        // within the slice (the caller resets it at slice boundaries).
+        const uint8_t* packed_src_base = src.tokens_per_slice > 0
+            ? src.packed_base + static_cast<size_t>(cur_tokid / src.tokens_per_slice) * src.slice_stride +
+                  NCCL_EP_COUNTED_HDR_BYTES + static_cast<size_t>(packed_dense_idx) * mr_info->bytes_per_entry
+            : src.packed_base + packed_dense_idx * mr_info->bytes_per_entry;
         const void* token_src = packed_src_base;
         const void* prob_src = packed_src_base + token_bytes;
         const void* sf_src = packed_src_base + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0);
@@ -1676,6 +1769,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     bool unordered_fabric,
     int dispatch_subputs,
     bool shared_signals,
+    bool counted_signals,
     uint64_t* dispatch_edge_totals,
     uint64_t expected_flag_value,
     const TOKEN_DATA_TYPE* attn_input_token,
@@ -1760,6 +1854,73 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                     token_idx_in_chunk < csize &&
                     attn_to_rdma_map[((token_idx_in_chunk + chunk_first_token_idx) * NUM_REMOTE_LSA) + remote_idx];
                 need_write_bitmask[i] = __ballot_sync(~0u, need_write);
+            }
+
+            if (unordered_fabric && counted_signals) {
+                // Counted-signal dispatch: one put per slice, headed by an in-band header,
+                // weak +1 on the chunk's source-shared signal. Records are staged dense
+                // within the slice right after the header, and the put copies header and
+                // records together so the header can only be visible if the put landed.
+                const int lane_id_w = static_cast<int>(ncclCoopWarp().thread_rank());
+                const uint8_t* token_src_base = reinterpret_cast<const uint8_t*>(attn_input_token);
+                const uint8_t* prob_src_base = reinterpret_cast<const uint8_t*>(attn_input_prob);
+                const unsigned sig = counted_dispatch_signal_id(smem_mr_info_ptr->signals_tail_base, cidx);
+                const int tps = smem_mr_info_ptr->counted_tokens_per_slice;
+                const uint32_t round = static_cast<uint32_t>(expected_flag_value);
+                for (int s = 0; s < dispatch_subputs; ++s) {
+                    // Staging is per destination (remote_idx); the receive slice is at this
+                    // sender's source slot on the destination (remote_slot).
+                    const size_t stage_off = counted_slice_offset(
+                        smem_mr_info_ptr, smem_mr_info_ptr->gin_send_staging_offset, remote_idx, cidx, s);
+                    const size_t recv_off = counted_slice_offset(
+                        smem_mr_info_ptr, smem_mr_info_ptr->gin_recv_staging_offset, remote_slot, cidx, s);
+                    uint8_t* slice_ptr = static_cast<uint8_t*>(gin_base_ptr) + stage_off;
+                    const int t_begin = s * tps;
+                    const int t_end = min(csize, t_begin + tps);
+                    int staged = 0;
+                    for (int t = t_begin; t < t_end; ++t) {
+                        if (!(need_write_bitmask[t / 32] & (1u << (t % 32)))) continue;
+                        const size_t token_idx = static_cast<size_t>(chunk_first_token_idx) + t;
+                        uint8_t* dst = slice_ptr + NCCL_EP_COUNTED_HDR_BYTES + static_cast<size_t>(staged) * entry_bytes;
+                        warp_copy_int4(dst, token_src_base + token_idx * token_bytes, token_bytes, lane_id_w);
+                        if constexpr (FORWARD_DISPATCH) {
+                            warp_copy_int4(
+                                dst + token_bytes,
+                                prob_src_base + (token_idx * LSA_TEAMS + remote_lteam_id) * prob_bytes,
+                                prob_bytes, lane_id_w);
+                        }
+                        if constexpr (HAS_SF) {
+                            warp_copy_int4(
+                                dst + token_bytes + (FORWARD_DISPATCH ? prob_bytes : 0),
+                                attn_input_token_scaling_factor + token_idx * sf_bytes_per_token,
+                                static_cast<size_t>(sf_bytes_per_token), lane_id_w);
+                        }
+                        ++staged;
+                    }
+                    __syncwarp();
+                    if (lane_id_w == 0) {
+                        *reinterpret_cast<uint64_t*>(slice_ptr) =
+                            counted_pack_header(round, static_cast<uint32_t>(staged), s + 1 < dispatch_subputs);
+                        __threadfence();
+                        net.put(
+                            rail,
+                            remote_lteam_id,
+                            nccl_internal_window,
+                            recv_off,
+                            nccl_internal_window,
+                            stage_off,
+                            NCCL_EP_COUNTED_HDR_BYTES + static_cast<size_t>(staged) * entry_bytes,
+                            ncclGin_WeakSignalAdd{sig, 1},
+                            ncclGin_None{},
+                            ncclCoopThread(),
+                            ncclGin_None{},
+                            cuda::thread_scope_thread,
+                            cuda::thread_scope_device,
+                            ncclGinOptFlagsDefault);
+                    }
+                    __syncwarp();
+                }
+                continue;
             }
 
             if (unordered_fabric) {
@@ -2215,6 +2376,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     const uint64_t expected_flag_value,
     const int dispatch_subputs,
     const bool shared_signals,
+    const bool counted_signals,
     const ncclDevComm& dcomm,
     int num_ctx_per_comm,
     void* gin_base_ptr,
@@ -2282,6 +2444,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     expected_flag_value,
                     dispatch_subputs,
                     shared_signals,
+                    counted_signals,
                     HIDDEN_DIM,
                     sf_bytes_per_token,
                     experts_per_rank,
@@ -2294,6 +2457,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     rdma_to_attn_map + (lteam_id * routing_map_lsa_stride) + (cidx * TOKENS_PER_CHUNK));
 
                 int packed_dense_idx = 0;
+                int packed_slice = 0;
                 for (int load_idx = 0; load_idx < routing_loads_in_chunk; load_idx++) {
                     routing_loads_t routing_flags = routing_map_ptr[load_idx];
 
@@ -2302,6 +2466,10 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                         int cur_tokid = load_idx * TOKENS_PER_ROUTING_LOAD + token_in_load;
                         if (cur_tokid >= csize) {
                             break;
+                        }
+                        if (src.tokens_per_slice > 0 && cur_tokid / src.tokens_per_slice != packed_slice) {
+                            packed_slice = cur_tokid / src.tokens_per_slice;
+                            packed_dense_idx = 0;
                         }
 
                         bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + token_in_load);
@@ -4489,6 +4657,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 param.unordered_fabric,
                 param.dispatch_subputs,
                 param.shared_signals,
+                param.counted_signals,
                 param.dispatch_edge_totals,
                 *param.expected_gin_flag_val,
                 param.attn_input_token,
@@ -4517,6 +4686,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             *param.expected_gin_flag_val,
             param.dispatch_subputs,
             param.shared_signals,
+            param.counted_signals,
             param.dcomm,
             param.num_ctx_per_comm,
             param.gin_base_ptr,

@@ -58,6 +58,12 @@ static constexpr int kCountersPerScEndpoint = 2; // FI_WRITE + FI_REMOTE_WRITE
 // Barrier slack kept at the tail of the signal space for NCCL-internal use.
 static constexpr int kBarrierSignalSlack = 32;
 
+// Counted-signal dispatch: bytes reserved at the head of every sub-put slice for the
+// in-band header (8 used, 16 keeps entries 16-byte aligned).
+#ifndef NCCL_EP_COUNTED_HDR_BYTES
+#define NCCL_EP_COUNTED_HDR_BYTES 16
+#endif
+
 // ---- signal namespace layout ------------------------------------------------
 __host__ __device__ constexpr int edge_chunk_signals(int rdma_team_size, int max_chunks_per_rank) {
     return (rdma_team_size - 1) * max_chunks_per_rank;
@@ -101,6 +107,18 @@ __host__ __device__ constexpr int shared_dispatch_tail_base(int rdma_team_size, 
 
 __host__ __device__ constexpr int shared_total_signals(int rdma_team_size, int num_ctx) {
     return 2 * edge_slot_signals(rdma_team_size, num_ctx) + kBarrierSignalSlack;
+}
+
+// Counted-signal dispatch (NCCL_EP_COUNTED_SIGNALS): one dispatch signal per
+// chunk, shared by every source. Sources are told apart by the in-band header
+// each sub-put carries, so the dispatch namespace has no source dimension and
+// the count is independent of node count. Combine keeps its per-edge layout.
+__host__ __device__ constexpr int counted_dispatch_tail_base(int rdma_team_size, int max_chunks_per_rank) {
+    return edge_chunk_signals(rdma_team_size, max_chunks_per_rank);
+}
+
+__host__ __device__ constexpr int counted_total_signals(int rdma_team_size, int max_chunks_per_rank) {
+    return edge_chunk_signals(rdma_team_size, max_chunks_per_rank) + max_chunks_per_rank + kBarrierSignalSlack;
 }
 
 // The two directions must tile the space exactly, with combine first: the
