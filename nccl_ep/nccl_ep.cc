@@ -4366,6 +4366,7 @@ ncclResult_t ncclEpDispatch(
             group->env.dispatch_subputs.value.ul > 0) {
             params.dispatch_subputs = static_cast<int>(group->env.dispatch_subputs.value.ul);
         }
+        params.local_first = nccl_ep_env_flag_on(group->env.ht_dispatch_local_first);
         // Pass device communicators and windows
         // Always pass a valid devComm (single-LSA-team too): the HT LSA sync-guard uses the NCCL LSA
         // barrier (needs comm.lsaBarrier). GIN/RDMA paths stay if-constexpr-gated (out single-LSA-team).

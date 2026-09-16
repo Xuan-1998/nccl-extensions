@@ -1095,6 +1095,9 @@ struct dispatch_kernel_param_base_t {
     // sender S2G dedups consecutive same-dest entries; secondary slots are filled
     // afterwards by the local_dup kernel.
     bool local_dup_enabled;
+    // G2S/S2G traversal order: false = chunk-outer/team-inner (self first within each
+    // chunk), true = team-outer/chunk-inner (all own-node chunks before any remote team).
+    bool local_first;
     // Cross-round WAR sync-guards: LSA (intra-LSA staging) uses the NCCL LSA barrier; RDMA
     // (cross-LSA-team staging) is hand-rolled. Only the enable flags are needed on the device now.
     bool guard_enabled; // cross-round WAR guard (LSA + RDMA share one enable)
@@ -2129,6 +2132,45 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     net.flush(ncclCoopWarp(), cuda::memory_order_acquire);
 }
 
+// Consumer traversal shared by the G2S producer and the S2G consumer of one pipeline.
+// The pipeline owns chunks cidx(m) = blockIdx.x + (pipeline_rank + m * NUM_PIPELINES) * NBLOCKS.
+// Teams are walked backward from self around the ring (j = 0 is self). With local_first the
+// team loop is outermost, so every own-node chunk is consumed before the first remote wait;
+// otherwise the chunk loop is outermost and self only leads within each chunk.
+template <int LSA_TEAMS, int NBLOCKS, int NUM_PIPELINES>
+struct dispatch_consumer_order_t {
+    int num_my_chunks;
+    int pipeline_rank;
+    int my_lteam;
+    bool local_first;
+
+    __device__ __forceinline__ dispatch_consumer_order_t(
+        int num_of_chunks_per_rank, int pipeline_rank_, int my_lteam_, bool local_first_)
+        : pipeline_rank(pipeline_rank_), my_lteam(my_lteam_), local_first(local_first_) {
+        const int first = blockIdx.x + pipeline_rank_ * NBLOCKS;
+        num_my_chunks = first < num_of_chunks_per_rank ?
+            1 + (num_of_chunks_per_rank - 1 - first) / (NUM_PIPELINES * NBLOCKS) : 0;
+    }
+
+    __device__ __forceinline__ int num_steps() const { return num_my_chunks * LSA_TEAMS; }
+
+    // Returns false once s is past the end; otherwise fills the (chunk, team) of step s.
+    __device__ __forceinline__ bool step(int s, int& cidx, int& lteam_id) const {
+        if (s >= num_steps()) return false;
+        int j, m;
+        if (local_first) {
+            j = s / num_my_chunks;
+            m = s % num_my_chunks;
+        } else {
+            m = s / LSA_TEAMS;
+            j = s % LSA_TEAMS;
+        }
+        cidx = blockIdx.x + (pipeline_rank + m * NUM_PIPELINES) * NBLOCKS;
+        lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
+        return true;
+    }
+};
+
 // Dispatch intra-LSA S2G warp group. With NUM_PIPELINES > 1, each warp is an
 // independent pipeline consumer paired with the G2S warp of the same pipeline_rank.
 template <
@@ -2161,6 +2203,7 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     const int experts_per_rank,
     const bool local_dup_enabled,
     const int max_recv_tokens_per_rank,
+    const bool local_first,
     SMEM_TYPE* smem_buffer_ptr) {
     constexpr int STAGES_PER_PIPELINE = NUM_STAGES / NUM_PIPELINES;
     static_assert(
@@ -2172,7 +2215,6 @@ __forceinline__ __device__ void dispatch_S2G_warp(
         TOKENS_PER_CHUNK % sizeof(routing_loads_t) == 0,
         "TOKENS_PER_CHUNK must be multiple of routing_loads_t.");
     constexpr int TOKENS_PER_ROUTING_LOAD = sizeof(routing_loads_t) / sizeof(bool);
-    constexpr int ROUTING_LOADS_PER_CHUNK = TOKENS_PER_CHUNK / TOKENS_PER_ROUTING_LOAD;
 
     // S2D inner dim: mode-dependent, carried by SMEM layout struct.
     const int s2d_inner_dim = smem_buffer_ptr->s2d_inner_dim;
@@ -2191,48 +2233,36 @@ __forceinline__ __device__ void dispatch_S2G_warp(
     // S2G on all 32 lanes (warp-uniform state); cp_async_bulk striped by lane=flat_idx (up to s2d_inner_dim stores/token).
     const int s2g_lane = LSA_S2G_GROUP::thread_rank() % 32;
 
-    // Each pipeline prefetches its own first s2d map for its first chunk (single TMA load, lane 0 only).
+    const dispatch_consumer_order_t<LSA_TEAMS, NBLOCKS, NUM_PIPELINES> order(
+        num_of_chunks_per_rank, pipeline_rank, my_lteam, local_first);
+    const auto chunk_size_of = [&](int chunk_idx) {
+        return (rem_chunk_sz != 0 && chunk_idx == num_of_chunks_per_rank - 1) ? rem_chunk_sz : TOKENS_PER_CHUNK;
+    };
+
+    // Each pipeline prefetches the s2d map of its first (chunk, team) step (single TMA load, lane 0 only).
     if (s2g_lane == 0) {
-        int chunk_iter = 0;
-        for (int chunk_idx = blockIdx.x; chunk_idx < num_of_chunks_per_rank; chunk_idx += NBLOCKS) {
-            if ((chunk_iter++ % NUM_PIPELINES) == pipeline_rank) {
-                int current_chunk_size;
-                if (rem_chunk_sz != 0 && chunk_idx == num_of_chunks_per_rank - 1) {
-                    current_chunk_size = rem_chunk_sz;
-                } else {
-                    current_chunk_size = TOKENS_PER_CHUNK;
-                }
-                dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, TOKENS_PER_CHUNK>(
-                    sparse_to_dense_map,
-                    smem_buffer_ptr,
-                    pipeline_rank,
-                    s2d_stage,
-                    my_lteam,
-                    chunk_idx,
-                    current_chunk_size,
-                    num_of_tokens_per_rank,
-                    s2d_inner_dim);
-                break;
-            }
+        int first_cidx, first_lteam;
+        if (order.step(0, first_cidx, first_lteam)) {
+            dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, TOKENS_PER_CHUNK>(
+                sparse_to_dense_map,
+                smem_buffer_ptr,
+                pipeline_rank,
+                s2d_stage,
+                first_lteam,
+                first_cidx,
+                chunk_size_of(first_cidx),
+                num_of_tokens_per_rank,
+                s2d_inner_dim);
         }
     }
     __syncwarp();
 
     {
-        int chunk_iter = 0;
-        for (int cidx = blockIdx.x; cidx < num_of_chunks_per_rank; cidx += NBLOCKS) {
-            if ((chunk_iter++ % NUM_PIPELINES) != pipeline_rank) continue;
-
-            int routing_loads_in_chunk;
-            int csize;
-            if (rem_chunk_sz != 0 && cidx == num_of_chunks_per_rank - 1) {
-                routing_loads_in_chunk = nccl_ep::ceil_div(rem_chunk_sz, (int)sizeof(routing_loads_t));
-                csize = rem_chunk_sz;
-            } else {
-                routing_loads_in_chunk = ROUTING_LOADS_PER_CHUNK;
-                csize = TOKENS_PER_CHUNK;
-            }
-            for (int j = 0; j < LSA_TEAMS; j++) {
+        int cidx, lteam_id;
+        for (int step = 0; order.step(step, cidx, lteam_id); step++) {
+            const int csize = chunk_size_of(cidx);
+            const int routing_loads_in_chunk = nccl_ep::ceil_div(csize, (int)sizeof(routing_loads_t));
+            {
                 // Per-pipeline self-sync (arrival count = 1, trivially satisfied); lane 0 only.
                 if (s2g_lane == 0) {
                     uint64_t state_token =
@@ -2244,34 +2274,10 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                 }
                 __syncwarp();
 
-                // Prefetch next (chunk, LSA team) s2d map for THIS pipeline (single TMA load, lane 0 only).
+                // Prefetch the next step's (chunk, LSA team) s2d map for THIS pipeline (single TMA load, lane 0 only).
                 if (s2g_lane == 0) {
-                    int next_chunk_id;
-                    int next_lsa_id;
-                    int next_lsa_iter = j + 1;
-                    if (next_lsa_iter < LSA_TEAMS) {
-                        next_chunk_id = cidx;
-                        next_lsa_id = (my_lteam + LSA_TEAMS - next_lsa_iter) % LSA_TEAMS;
-                    } else {
-                        // Find the next chunk this pipeline will process
-                        int future_chunk_iter = chunk_iter; // chunk_iter was already incremented for current chunk
-                        next_chunk_id = -1;
-                        for (int fi = cidx + NBLOCKS; fi < num_of_chunks_per_rank; fi += NBLOCKS) {
-                            if ((future_chunk_iter++ % NUM_PIPELINES) == pipeline_rank) {
-                                next_chunk_id = fi;
-                                break;
-                            }
-                        }
-                        next_lsa_id = my_lteam;
-                    }
-
-                    if (next_chunk_id >= 0 && next_chunk_id < num_of_chunks_per_rank) {
-                        int next_chunk_size;
-                        if (rem_chunk_sz != 0 && next_chunk_id == num_of_chunks_per_rank - 1) {
-                            next_chunk_size = rem_chunk_sz;
-                        } else {
-                            next_chunk_size = TOKENS_PER_CHUNK;
-                        }
+                    int next_chunk_id, next_lsa_id;
+                    if (order.step(step + 1, next_chunk_id, next_lsa_id)) {
                         dispatch_s2g_prefetch_s2d_map<SMEM_TYPE, TOKENS_PER_CHUNK>(
                             sparse_to_dense_map,
                             smem_buffer_ptr,
@@ -2279,14 +2285,12 @@ __forceinline__ __device__ void dispatch_S2G_warp(
                             s2d_stage ^ 1,
                             next_lsa_id,
                             next_chunk_id,
-                            next_chunk_size,
+                            chunk_size_of(next_chunk_id),
                             num_of_tokens_per_rank,
                             s2d_inner_dim);
                     }
                 }
 
-                // Walk LSA teams backward from self around the ring (j=0 -> self, j>=1 -> remote)
-                int lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
                 const routing_loads_t* routing_map_ptr = reinterpret_cast<const routing_loads_t*>(
                     rdma_to_attn_map + (lteam_id * routing_map_lsa_stride + cidx * TOKENS_PER_CHUNK));
 
@@ -2407,6 +2411,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     int num_ctx_per_comm,
     void* gin_base_ptr,
     const struct dispatch_memory_region_info_t* mr_info,
+    const bool local_first,
     SMEM_TYPE* smem_buffer_ptr) {
     using routing_loads_t = uint4;
 
@@ -2419,7 +2424,6 @@ __forceinline__ __device__ void dispatch_G2S_warp(
         "MAX_TOKENS_PER_RANK must be multiple of TOKENS_PER_CHUNK.");
 
     constexpr int TOKENS_PER_ROUTING_LOAD = sizeof(routing_loads_t) / sizeof(bool);
-    constexpr int ROUTING_LOADS_PER_CHUNK = TOKENS_PER_CHUNK / TOKENS_PER_ROUTING_LOAD;
     constexpr int STAGES_PER_PIPELINE = NUM_STAGES / NUM_PIPELINES;
 
     const int pipeline_rank = LSA_G2S_GROUP::warp_rank();
@@ -2433,24 +2437,15 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     int tokens_produced = 0;
 
     if (cuda::ptx::elect_sync(~0)) {
-        int chunk_iter = 0;
-        for (int cidx = blockIdx.x; cidx < num_of_chunks_per_rank; cidx += NBLOCKS) {
-            if ((chunk_iter++ % NUM_PIPELINES) != pipeline_rank) continue;
+        const dispatch_consumer_order_t<LSA_TEAMS, NBLOCKS, NUM_PIPELINES> order(
+            num_of_chunks_per_rank, pipeline_rank, my_lteam, local_first);
+        int cidx, lteam_id;
+        for (int step = 0; order.step(step, cidx, lteam_id); step++) {
+            const int csize =
+                (rem_chunk_sz != 0 && cidx == num_of_chunks_per_rank - 1) ? rem_chunk_sz : TOKENS_PER_CHUNK;
+            const int routing_loads_in_chunk = nccl_ep::ceil_div(csize, (int)sizeof(routing_loads_t));
 
-            int routing_loads_in_chunk;
-            int csize;
-            if (rem_chunk_sz != 0 && cidx == num_of_chunks_per_rank - 1) {
-                routing_loads_in_chunk = nccl_ep::ceil_div(rem_chunk_sz, (int)sizeof(routing_loads_t));
-                csize = rem_chunk_sz;
-            } else {
-                routing_loads_in_chunk = ROUTING_LOADS_PER_CHUNK;
-                csize = TOKENS_PER_CHUNK;
-            }
-
-            for (int j = 0; j < LSA_TEAMS; j++) {
-                // Walk LSA teams backward from self around the ring (j=0 -> self, j>=1 -> remote)
-                int lteam_id = (my_lteam + LSA_TEAMS - j) % LSA_TEAMS;
-
+            {
                 g2s_source_t<TOKEN_DATA_TYPE> src = dispatch_g2s_resolve_source<
                     TOKEN_DATA_TYPE,
                     LSA_TEAMS,
@@ -4718,6 +4713,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.num_ctx_per_comm,
             param.gin_base_ptr,
             &param.mr_info,
+            param.local_first,
             smem_buffer_ptr);
 #undef DISPATCH_G2S_TEMPLATE
     } else if (
@@ -4739,6 +4735,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.experts_per_rank,
             param.local_dup_enabled,
             param.max_recv_tokens_per_rank,
+            param.local_first,
             smem_buffer_ptr);
 #undef DISPATCH_S2G_TEMPLATE
     } else if (

@@ -74,6 +74,9 @@ struct ncclEpEnvConfig {
     // With counted_signals: pack the staging slices in a separate kernel before dispatch so
     // the N2N warps only issue puts (HLD 5.1 scan-phase pack).
     ncclEpEnvVar counted_prepack{"NCCL_EP_COUNTED_PREPACK", ncclEpEnvType::flag};
+    // HT dispatch consumer order: drain all of this rank's own-node chunks before any
+    // remote team (team-outer) instead of walking teams inside every chunk.
+    ncclEpEnvVar ht_dispatch_local_first{"NCCL_EP_HT_DISPATCH_LOCAL_FIRST", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar shuffle_sms{"NCCL_EP_SHUFFLE_SMS", ncclEpEnvType::ulong};

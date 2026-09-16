@@ -503,6 +503,7 @@ struct DispatchParams {
     bool counted_signals = false; // per-chunk signal shared by sources + in-band sub-put headers
     bool counted_prepack = false; // staging packed by a pre-kernel; N2N only issues puts
     uint64_t* dispatch_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
+    bool local_first = false; // consumer walks teams outer, chunks inner (own node first)
 
     // Backstop bound for recv slot indices (see dispatch_kernel_param_base_t).
     int max_recv_tokens_per_rank = 0;

@@ -985,6 +985,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.lsa_team = params.lsa_team;
     kp.num_of_tokens_per_rank = params.tokens_per_lsa;
     kp.local_dup_enabled = (params.local_dup_num_sms > 0);
+    kp.local_first = params.local_first;
     kp.guard_enabled = params.guard_enabled;
     kp.max_recv_tokens_per_rank = params.max_recv_tokens_per_rank;
     kp.unordered_fabric = params.unordered_fabric;
