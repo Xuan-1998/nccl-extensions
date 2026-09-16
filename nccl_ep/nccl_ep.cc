@@ -4358,6 +4358,7 @@ ncclResult_t ncclEpDispatch(
         params.unordered_fabric = nccl_ep_env_flag_on(group->env.unordered_fabric);
         params.shared_signals = params.unordered_fabric && nccl_ep_env_flag_on(group->env.shared_signals);
         params.counted_signals = params.unordered_fabric && nccl_ep_env_flag_on(group->env.counted_signals);
+        params.counted_prepack = params.counted_signals && nccl_ep_env_flag_on(group->env.counted_prepack);
         params.dispatch_edge_totals = group->ht_buffers.dev_dispatch_edge_totals;
         // Weak signals per (chunk, edge) per round; >1 only in unordered mode.
         params.dispatch_subputs = 1;

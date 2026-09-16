@@ -1115,6 +1115,8 @@ struct dispatch_kernel_param_base_t {
     uint64_t* dispatch_edge_totals; // per (edge, ctx-slot) atomic totals
     // Counted-signal mode (NCCL_EP_COUNTED_SIGNALS): see counted_pack_header.
     bool counted_signals;
+    // Staging already packed (headers included) by counted_prepack_kernel; N2N only puts.
+    bool counted_prepack;
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     dispatch_warp_timing_entry_t* warp_timing;
 #endif
@@ -1770,6 +1772,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
     int dispatch_subputs,
     bool shared_signals,
     bool counted_signals,
+    bool counted_prepack,
     uint64_t* dispatch_edge_totals,
     uint64_t expected_flag_value,
     const TOKEN_DATA_TYPE* attn_input_token,
@@ -1875,6 +1878,29 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                     const size_t recv_off = counted_slice_offset(
                         smem_mr_info_ptr, smem_mr_info_ptr->gin_recv_staging_offset, remote_slot, cidx, s);
                     uint8_t* slice_ptr = static_cast<uint8_t*>(gin_base_ptr) + stage_off;
+                    if (counted_prepack) {
+                        // Slice already packed (header included) before this kernel; just put it.
+                        if (lane_id_w == 0) {
+                            const uint32_t count = counted_header_count(*reinterpret_cast<const uint64_t*>(slice_ptr));
+                            net.put(
+                                rail,
+                                remote_lteam_id,
+                                nccl_internal_window,
+                                recv_off,
+                                nccl_internal_window,
+                                stage_off,
+                                NCCL_EP_COUNTED_HDR_BYTES + static_cast<size_t>(count) * entry_bytes,
+                                ncclGin_WeakSignalAdd{sig, 1},
+                                ncclGin_None{},
+                                ncclCoopThread(),
+                                ncclGin_None{},
+                                cuda::thread_scope_thread,
+                                cuda::thread_scope_device,
+                                ncclGinOptFlagsDefault);
+                        }
+                        __syncwarp();
+                        continue;
+                    }
                     const int t_begin = s * tps;
                     const int t_end = min(csize, t_begin + tps);
                     int staged = 0;
@@ -4658,6 +4684,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 param.dispatch_subputs,
                 param.shared_signals,
                 param.counted_signals,
+                param.counted_prepack,
                 param.dispatch_edge_totals,
                 *param.expected_gin_flag_val,
                 param.attn_input_token,

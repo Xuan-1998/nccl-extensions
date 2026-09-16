@@ -501,6 +501,7 @@ struct DispatchParams {
     int dispatch_subputs = 1;
     bool shared_signals = false; // per (edge, ctx-slot) signals + per-chunk headers
     bool counted_signals = false; // per-chunk signal shared by sources + in-band sub-put headers
+    bool counted_prepack = false; // staging packed by a pre-kernel; N2N only issues puts
     uint64_t* dispatch_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
 
     // Backstop bound for recv slot indices (see dispatch_kernel_param_base_t).
@@ -595,6 +596,7 @@ struct CombineParams {
     uint64_t* combine_sent_totals = nullptr; // sender cumulative signal totals (unordered mode)
     bool shared_signals = false; // per (edge, ctx-slot) signals + per-chunk headers
     bool counted_signals = false; // per-chunk signal shared by sources + in-band sub-put headers
+    bool counted_prepack = false; // staging packed by a pre-kernel; N2N only issues puts
     uint64_t* combine_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
 };
 

@@ -991,6 +991,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.dispatch_subputs = params.dispatch_subputs;
     kp.shared_signals = params.shared_signals;
     kp.counted_signals = params.counted_signals;
+    kp.counted_prepack = params.counted_prepack;
     kp.dispatch_edge_totals = params.dispatch_edge_totals;
 
     // Pass device communicators and windows
@@ -1058,6 +1059,110 @@ std::vector<uint8_t> build_dispatch_arg_buffer(
 
 // Host dispatch launcher. The JIT source owns all device-kernel specialization;
 // the host only asks ht_ep for the matching dynamic-SMEM size.
+
+// ============================================================================
+// Counted-signal pre-pack (NCCL_EP_COUNTED_PREPACK): fill every (destination, chunk,
+// slice) staging slice with [header | dense records] before the dispatch kernel runs,
+// so its N2N warps only issue puts. Grid: (chunks, remote destinations, slices).
+// ============================================================================
+#ifndef NCCL_EP_COUNTED_HDR_BYTES
+#define NCCL_EP_COUNTED_HDR_BYTES 16
+#endif
+
+namespace {
+
+struct counted_prepack_args_t {
+    const uint8_t* token;
+    const uint8_t* prob;
+    const uint8_t* sf;
+    const bool* attn_to_rdma_map;
+    const uint64_t* round_ptr;
+    uint8_t* gin_base;
+    size_t send_staging_offset;
+    size_t slice_stride;
+    size_t chunk_stride;
+    size_t max_chunks;
+    size_t entry_bytes;
+    int tokens_per_slice;
+    int subputs;
+    int num_tokens;
+    int tokens_per_chunk;
+    int num_remote;
+    int my_lteam;
+    int lsa_teams;
+    uint32_t token_bytes;
+    uint32_t prob_bytes;
+    uint32_t sf_bytes;
+};
+
+__device__ __forceinline__ void prepack_copy(uint8_t* dst, const uint8_t* src, uint32_t bytes, int lane) {
+    // 16-byte granularity; all payload fields here are multiples of 16.
+    const int4* s4 = reinterpret_cast<const int4*>(src);
+    int4* d4 = reinterpret_cast<int4*>(dst);
+    for (uint32_t i = lane; i < bytes / 16; i += 32) d4[i] = s4[i];
+}
+
+__global__ void __launch_bounds__(256) counted_prepack_kernel(counted_prepack_args_t a) {
+    const int cidx = blockIdx.x;
+    const int remote_idx = blockIdx.y;
+    const int s = blockIdx.z;
+    const int remote_lteam = remote_idx < a.my_lteam ? remote_idx : remote_idx + 1;
+    const int chunk_first = cidx * a.tokens_per_chunk;
+    const int csize = min(a.tokens_per_chunk, a.num_tokens - chunk_first);
+    const int t_begin = s * a.tokens_per_slice;
+    const int t_end = min(csize, t_begin + a.tokens_per_slice);
+    const int n = max(0, t_end - t_begin);
+
+    __shared__ int warp_counts[8];
+    __shared__ int dense_of[256];
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+
+    // Routing flags for the slice's tokens (tokens_per_slice <= 256), then a block scan
+    // so every routed token knows its dense position within the slice.
+    bool need = false;
+    if (tid < n) {
+        need = a.attn_to_rdma_map[static_cast<size_t>(chunk_first + t_begin + tid) * a.num_remote + remote_idx];
+    }
+    const unsigned ballot = __ballot_sync(~0u, need);
+    if (lane == 0) warp_counts[warp] = __popc(ballot);
+    __syncthreads();
+    int warp_prefix = 0;
+    for (int w = 0; w < warp; ++w) warp_prefix += warp_counts[w];
+    int total = 0;
+    for (int w = 0; w < 8; ++w) total += warp_counts[w];
+    if (tid < n) dense_of[tid] = need ? warp_prefix + __popc(ballot & ((1u << lane) - 1)) : -1;
+    __syncthreads();
+
+    uint8_t* slice = a.gin_base + a.send_staging_offset +
+        (static_cast<size_t>(remote_idx) * a.max_chunks + static_cast<size_t>(cidx)) * a.chunk_stride +
+        static_cast<size_t>(s) * a.slice_stride;
+    for (int t = warp; t < n; t += 8) {
+        const int d = dense_of[t];
+        if (d < 0) continue;
+        const size_t tok = static_cast<size_t>(chunk_first + t_begin + t);
+        uint8_t* dst = slice + NCCL_EP_COUNTED_HDR_BYTES + static_cast<size_t>(d) * a.entry_bytes;
+        prepack_copy(dst, a.token + tok * a.token_bytes, a.token_bytes, lane);
+        if (a.prob_bytes) {
+            prepack_copy(dst + a.token_bytes,
+                         a.prob + (tok * static_cast<size_t>(a.lsa_teams) + remote_lteam) * a.prob_bytes,
+                         a.prob_bytes, lane);
+        }
+        if (a.sf_bytes) {
+            prepack_copy(dst + a.token_bytes + a.prob_bytes, a.sf + tok * a.sf_bytes, a.sf_bytes, lane);
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const uint32_t round = static_cast<uint32_t>(*a.round_ptr);
+        const uint64_t hdr = (1ull << 63) | (static_cast<uint64_t>(round & 0x7fffffffu) << 32) |
+                             (static_cast<uint64_t>(static_cast<uint32_t>(total) & 0x3fffffffu) << 1) |
+                             (s + 1 < a.subputs ? 1ull : 0ull);
+        *reinterpret_cast<uint64_t*>(slice) = hdr;
+    }
+}
+
+}  // namespace
+
 ncclResult_t dispatch_impl(
     const DispatchParams& params,
     int max_dispatch_tokens_per_rank,
@@ -1232,6 +1337,42 @@ ncclResult_t dispatch_impl(
             cudaMemsetAsync(d_wt, 0, dispatch_wt_total * sizeof(::ht_ep::dispatch_warp_timing_entry_t), stream));
         kp.warp_timing = d_wt;
 #endif
+
+        if (params.counted_signals && params.counted_prepack && num_lsa_teams > 1) {
+            const int subputs = std::max(1, params.dispatch_subputs);
+            const int tps = params.mr_info.counted_tokens_per_slice;
+            const int num_chunks = (params.tokens_per_lsa + num_tokens_per_chunk - 1) / num_tokens_per_chunk;
+            if (tps <= 0 || tps > 256) {
+                fprintf(stderr, "[HT] counted prepack needs tokens_per_chunk/subputs <= 256 (got %d)\n", tps);
+                return ncclInvalidArgument;
+            }
+            counted_prepack_args_t a{};
+            a.token = static_cast<const uint8_t*>(params.attn_input_token);
+            a.prob = reinterpret_cast<const uint8_t*>(params.attn_input_prob);
+            a.sf = static_cast<const uint8_t*>(params.attn_input_scaling_factor);
+            a.attn_to_rdma_map = params.attn_to_rdma_map;
+            a.round_ptr = params.expected_gin_flag_val;
+            a.gin_base = static_cast<uint8_t*>(params.gin_base_ptr);
+            a.send_staging_offset = params.mr_info.gin_send_staging_offset;
+            a.slice_stride = params.mr_info.counted_slice_stride;
+            a.chunk_stride = params.mr_info.counted_chunk_stride;
+            a.max_chunks = params.mr_info.counted_max_chunks;
+            a.entry_bytes = params.mr_info.bytes_per_entry;
+            a.tokens_per_slice = tps;
+            a.subputs = subputs;
+            a.num_tokens = params.tokens_per_lsa;
+            a.tokens_per_chunk = num_tokens_per_chunk;
+            a.num_remote = num_lsa_teams - 1;
+            a.my_lteam = params.lsa_team;
+            a.lsa_teams = num_lsa_teams;
+            a.token_bytes = static_cast<uint32_t>(kp.hidden_dim) * kernel_spec.payload_bytes;
+            a.prob_bytes = (pass_direction == NCCL_EP_FWD_PASS)
+                ? static_cast<uint32_t>(params.experts_per_rank * params.lsa_team_size * sizeof(float)) : 0u;
+            a.sf_bytes = static_cast<uint32_t>(sf_bytes_per_token);
+            dim3 grid(num_chunks, num_lsa_teams - 1, subputs);
+            counted_prepack_kernel<<<grid, 256, 0, stream>>>(a);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
         std::vector<uint8_t> kernel_arg = build_dispatch_arg_buffer(kp, params);
         if (ncclResult_t r = jit::launch_dispatch(

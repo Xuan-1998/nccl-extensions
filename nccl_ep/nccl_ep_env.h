@@ -71,6 +71,9 @@ struct ncclEpEnvConfig {
     // one signal per chunk shared by every source; each sub-put carries an in-band
     // header and the receiver gates on landed >= visible headers (DeepEP-EFA style).
     ncclEpEnvVar counted_signals{"NCCL_EP_COUNTED_SIGNALS", ncclEpEnvType::flag};
+    // With counted_signals: pack the staging slices in a separate kernel before dispatch so
+    // the N2N warps only issue puts (HLD 5.1 scan-phase pack).
+    ncclEpEnvVar counted_prepack{"NCCL_EP_COUNTED_PREPACK", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar shuffle_sms{"NCCL_EP_SHUFFLE_SMS", ncclEpEnvType::ulong};
