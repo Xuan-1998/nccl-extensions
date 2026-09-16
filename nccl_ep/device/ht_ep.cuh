@@ -2000,8 +2000,12 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                 // Zero-token chunks send a bare weak +1 so every edge still accrues
                 // exactly 1 per round.
                 const int lane_id_w = static_cast<int>(ncclCoopWarp().thread_rank());
+                // Staging is per destination (remote_idx). remote_slot is this sender's
+                // slot at the destination and repeats across destinations when
+                // LSA_TEAMS > 2, so using it here would let the put for one
+                // destination read staging that is being repacked for the next.
                 const size_t staging_off = smem_mr_info_ptr->gin_send_staging_offset +
-                    (static_cast<size_t>(remote_slot) * smem_mr_info_ptr->max_tokens_per_dest +
+                    (static_cast<size_t>(remote_idx) * smem_mr_info_ptr->max_tokens_per_dest +
                      static_cast<size_t>(chunk_first_token_idx)) * entry_bytes;
                 uint8_t* staging_ptr = static_cast<uint8_t*>(gin_base_ptr) + staging_off;
                 const uint8_t* token_src_base = reinterpret_cast<const uint8_t*>(attn_input_token);
@@ -2020,8 +2024,7 @@ __forceinline__ __device__ void dispatch_N2N_warp(
                     ? shared_edge_signal_id(smem_mr_info_ptr->signals_tail_base,
                                             my_lteam, remote_lteam_id, ctx_slot, num_ctx_per_comm)
                     : tail_signal_id;
-                const int edge_slot_idx =
-                    (my_lteam < remote_lteam_id ? my_lteam : my_lteam - 1) * num_ctx_per_comm + ctx_slot;
+                const int edge_slot_idx = remote_idx * num_ctx_per_comm + ctx_slot;
                 const int tokens_per_slice = nccl_ep::ceil_div(csize, dispatch_subputs);
                 int staged = 0;
                 for (int s = 0; s < dispatch_subputs; ++s) {
@@ -3445,6 +3448,11 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
         // Header slot stays per (src_remote, chunk) in both sub-modes; what varies
         // is which signal the +1s ride and whose cumulative total the header carries.
         const unsigned hdr_idx = static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + chunk_id);
+        // The sender's running total is per destination. hdr_idx is my slot at the
+        // destination, which is the same value for several destinations when
+        // LSA_TEAMS > 2, so it must not index sender-side state.
+        const int combine_dst_remote = lteam_id < my_lteam ? lteam_id : lteam_id - 1;
+        const unsigned tot_idx = static_cast<unsigned>(combine_dst_remote * MAX_CHUNKS_PER_RANK + chunk_id);
         uint64_t new_total;
         unsigned ride_id = signal_id;
         if (shared_signals) {
@@ -3454,8 +3462,8 @@ __forceinline__ __device__ void combine_n2n_signal_remote(
                         static_cast<uint64_t>(n_weak_puts) + 1ull;
             ride_id = shared_sig_id;
         } else {
-            new_total = combine_sent_totals[hdr_idx] + static_cast<uint64_t>(n_weak_puts) + 1;
-            combine_sent_totals[hdr_idx] = new_total;
+            new_total = combine_sent_totals[tot_idx] + static_cast<uint64_t>(n_weak_puts) + 1;
+            combine_sent_totals[tot_idx] = new_total;
         }
         const uint64_t hdr = (expected_flag_value << 32) | (new_total & 0xffffffffull);
         net.putValue(
@@ -3585,7 +3593,9 @@ __forceinline__ __device__ void combine_N2N_inter_warp(
         const unsigned c_shared_id = signals_base + combine_signal_offset +
             static_cast<unsigned>(combine_src_remote_s * num_ctx_per_comm + c_ctx_slot);
         const unsigned put_signal_id = shared_signals ? c_shared_id : combine_tail_signal_id;
-        const int c_edge_slot_idx = combine_src_remote_s * num_ctx_per_comm + c_ctx_slot;
+        // Sender-side totals are per destination (see combine_n2n_signal_remote).
+        const int combine_dst_remote_s = lteam_id < my_lteam ? lteam_id : lteam_id - 1;
+        const int c_edge_slot_idx = combine_dst_remote_s * num_ctx_per_comm + c_ctx_slot;
         int n_weak_puts = 0;
         if constexpr (STREAMING_BATCH > 0) {
             // ---- STREAMING PATH: process tokens as reduction warp produces them ----
