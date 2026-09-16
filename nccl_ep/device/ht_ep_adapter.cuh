@@ -502,6 +502,7 @@ struct DispatchParams {
     bool shared_signals = false; // per (edge, ctx-slot) signals + per-chunk headers
     bool counted_signals = false; // per-chunk signal shared by sources + in-band sub-put headers
     bool counted_prepack = false; // staging packed by a pre-kernel; N2N only issues puts
+    bool counted_slice_consume = false; // G2S gates per sub-put slice
     uint64_t* dispatch_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
     bool local_first = false; // consumer walks teams outer, chunks inner (own node first)
 
@@ -598,6 +599,7 @@ struct CombineParams {
     bool shared_signals = false; // per (edge, ctx-slot) signals + per-chunk headers
     bool counted_signals = false; // per-chunk signal shared by sources + in-band sub-put headers
     bool counted_prepack = false; // staging packed by a pre-kernel; N2N only issues puts
+    bool counted_slice_consume = false; // G2S gates per sub-put slice
     uint64_t* combine_edge_totals = nullptr; // per (edge, ctx-slot) atomic totals
 };
 

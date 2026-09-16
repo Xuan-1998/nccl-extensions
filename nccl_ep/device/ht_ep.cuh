@@ -239,6 +239,43 @@ __forceinline__ __device__ size_t counted_slice_offset(
            static_cast<size_t>(s) * mr->counted_slice_stride;
 }
 
+// Counted-signal receiver gate for one (source slot, chunk): returns once slices
+// [0, upto_slice] of my_slot have visible headers for this round and the chunk's shared
+// counter covers every visible header. With upto_slice = S-1 the whole chunk is gated;
+// smaller values let the consumer start on early slices while later ones are in flight.
+__forceinline__ __device__ void counted_wait_slices(
+    ncclGin& net,
+    const dispatch_memory_region_info_t* mr_info,
+    const uint8_t* base,
+    int num_sources,
+    int my_slot,
+    int cidx,
+    int dispatch_subputs,
+    int upto_slice,
+    uint64_t expected_flag_value) {
+    const unsigned sig = counted_dispatch_signal_id(mr_info->signals_tail_base, cidx);
+    const uint32_t round = static_cast<uint32_t>(expected_flag_value);
+    const uint64_t prev_rounds =
+        (expected_flag_value - 1ull) * static_cast<uint64_t>(num_sources) * static_cast<uint64_t>(dispatch_subputs);
+    for (;;) {
+        int my_valid = 0, num_valid = 0;
+        for (int slot = 0; slot < num_sources; ++slot) {
+            for (int sp = 0; sp < dispatch_subputs; ++sp) {
+                const uint64_t hdr = nccl_ep::ld_relaxed_sys_global(reinterpret_cast<const uint64_t*>(
+                    base + counted_slice_offset(mr_info, mr_info->gin_recv_staging_offset, slot, cidx, sp)));
+                if (counted_header_valid(hdr, round)) {
+                    ++num_valid;
+                    if (slot == my_slot && sp <= upto_slice) ++my_valid;
+                }
+            }
+        }
+        if (my_valid == upto_slice + 1 &&
+            net.readSignal(sig) >= prev_rounds + static_cast<uint64_t>(num_valid)) {
+            return;
+        }
+    }
+}
+
 struct combine_memory_region_info_t {
     size_t combine_red_token_offset; // Offset of combine LSA-team-reduced token buffer
     size_t combine_g2s_token_offset; // Offset of combine cross-LSA-team (N2N RDMA) token buffer
@@ -1120,6 +1157,8 @@ struct dispatch_kernel_param_base_t {
     bool counted_signals;
     // Staging already packed (headers included) by counted_prepack_kernel; N2N only puts.
     bool counted_prepack;
+    // Consume counted sub-put slices as they land instead of gating the whole chunk.
+    bool counted_slice_consume;
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
     dispatch_warp_timing_entry_t* warp_timing;
 #endif
@@ -1320,6 +1359,9 @@ struct g2s_source_t {
     // preceded by a header; 0 means the flat packed layout.
     int tokens_per_slice;
     size_t slice_stride;
+    // Counted-signal slice-granular gating state (see counted_wait_slices).
+    int counted_slot;
+    int counted_slices_gated;
     const TOKEN_DATA_TYPE* token_base;
     const float* prob_base;
     const uint8_t* sf_base;
@@ -1347,6 +1389,7 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     const int dispatch_subputs,
     const bool shared_signals,
     const bool counted_signals,
+    const bool counted_slice_consume,
     const int HIDDEN_DIM,
     const int sf_bytes_per_token,
     const int experts_per_rank,
@@ -1359,6 +1402,8 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
     src.packed_base = nullptr;
     src.tokens_per_slice = 0;
     src.slice_stride = 0;
+    src.counted_slot = 0;
+    src.counted_slices_gated = 0;
     src.token_base = nullptr;
     src.prob_base = nullptr;
     src.sf_base = nullptr;
@@ -1396,28 +1441,13 @@ __forceinline__ __device__ g2s_source_t<TOKEN_DATA_TYPE> dispatch_g2s_resolve_so
             // wait for our own subputs headers to be visible and for that equality.
             constexpr int NUM_SOURCES = LSA_TEAMS - 1;
             const int my_slot = lteam_id > my_lteam ? lteam_id - 1 : lteam_id;
-            const unsigned sig = counted_dispatch_signal_id(mr_info->signals_tail_base, cidx);
-            const uint32_t round = static_cast<uint32_t>(expected_flag_value);
-            const uint64_t prev_rounds =
-                (expected_flag_value - 1ull) * static_cast<uint64_t>(NUM_SOURCES) * static_cast<uint64_t>(dispatch_subputs);
             const uint8_t* base = static_cast<const uint8_t*>(gin_base_ptr);
-            for (;;) {
-                int my_valid = 0, num_valid = 0;
-                for (int slot = 0; slot < NUM_SOURCES; ++slot) {
-                    for (int sp = 0; sp < dispatch_subputs; ++sp) {
-                        const uint64_t hdr = nccl_ep::ld_relaxed_sys_global(reinterpret_cast<const uint64_t*>(
-                            base + counted_slice_offset(mr_info, mr_info->gin_recv_staging_offset, slot, cidx, sp)));
-                        if (counted_header_valid(hdr, round)) {
-                            ++num_valid;
-                            if (slot == my_slot) ++my_valid;
-                        }
-                    }
-                }
-                if (my_valid == dispatch_subputs &&
-                    net.readSignal(sig) >= prev_rounds + static_cast<uint64_t>(num_valid)) {
-                    break;
-                }
-            }
+            // Slice-granular consumption: gate slice 0 here; the G2S loop gates later slices
+            // as it reaches them (counted_slices_gated).
+            counted_wait_slices(net, mr_info, base, NUM_SOURCES, my_slot, cidx, dispatch_subputs,
+                                counted_slice_consume ? 0 : dispatch_subputs - 1, expected_flag_value);
+            src.counted_slot = my_slot;
+            src.counted_slices_gated = counted_slice_consume ? 1 : dispatch_subputs;
             src.use_packed = true;
             src.tokens_per_slice = mr_info->counted_tokens_per_slice;
             src.slice_stride = mr_info->counted_slice_stride;
@@ -2407,6 +2437,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
     const int dispatch_subputs,
     const bool shared_signals,
     const bool counted_signals,
+    const bool counted_slice_consume,
     const ncclDevComm& dcomm,
     int num_ctx_per_comm,
     void* gin_base_ptr,
@@ -2466,6 +2497,7 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                     dispatch_subputs,
                     shared_signals,
                     counted_signals,
+                    counted_slice_consume,
                     HIDDEN_DIM,
                     sf_bytes_per_token,
                     experts_per_rank,
@@ -2491,6 +2523,18 @@ __forceinline__ __device__ void dispatch_G2S_warp(
                         if (src.tokens_per_slice > 0 && cur_tokid / src.tokens_per_slice != packed_slice) {
                             packed_slice = cur_tokid / src.tokens_per_slice;
                             packed_dense_idx = 0;
+                            if (packed_slice >= src.counted_slices_gated) {
+                                // Slice-granular gate: wait for this slice (and any before it) to land.
+                                constexpr int N2N_WARPS_G = (LSA_TEAMS == 1) ? 1 : NCCL_EP_HT_DISPATCH_N2N_WARPS;
+                                const int ch = cidx % (NBLOCKS * N2N_WARPS_G);
+                                const auto sharing = (NBLOCKS * N2N_WARPS_G <= num_ctx_per_comm)
+                                    ? NCCL_GIN_RESOURCE_SHARING_CTA : NCCL_GIN_RESOURCE_SHARING_GPU;
+                                ncclGin net_g(dcomm, get_data_ctx(ch, num_ctx_per_comm), sharing);
+                                counted_wait_slices(net_g, mr_info, static_cast<const uint8_t*>(gin_base_ptr),
+                                                    LSA_TEAMS - 1, src.counted_slot, cidx, dispatch_subputs,
+                                                    packed_slice, expected_flag_value);
+                                src.counted_slices_gated = packed_slice + 1;
+                            }
                         }
 
                         bool token_needed = *(reinterpret_cast<bool*>(&routing_flags) + token_in_load);
@@ -4709,6 +4753,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
             param.dispatch_subputs,
             param.shared_signals,
             param.counted_signals,
+            param.counted_slice_consume,
             param.dcomm,
             param.num_ctx_per_comm,
             param.gin_base_ptr,

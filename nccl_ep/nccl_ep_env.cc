@@ -58,6 +58,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->shared_signals);
     parse_flag(cfg->counted_signals);
     parse_flag(cfg->counted_prepack);
+    parse_flag(cfg->counted_slice_consume);
     parse_flag(cfg->ht_dispatch_local_first);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
@@ -91,6 +92,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.shared_signals,
         &cfg.counted_signals,
         &cfg.counted_prepack,
+        &cfg.counted_slice_consume,
         &cfg.ht_dispatch_local_first,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,

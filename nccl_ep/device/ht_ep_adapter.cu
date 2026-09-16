@@ -993,6 +993,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.shared_signals = params.shared_signals;
     kp.counted_signals = params.counted_signals;
     kp.counted_prepack = params.counted_prepack;
+    kp.counted_slice_consume = params.counted_slice_consume;
     kp.dispatch_edge_totals = params.dispatch_edge_totals;
 
     // Pass device communicators and windows
