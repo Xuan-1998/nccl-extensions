@@ -258,6 +258,12 @@ __forceinline__ __device__ void counted_wait_slices(
     const uint64_t prev_rounds =
         (expected_flag_value - 1ull) * static_cast<uint64_t>(num_sources) * static_cast<uint64_t>(dispatch_subputs);
     for (;;) {
+        // Read the counter before the headers. The gate is sound only if every
+        // put counted here also shows up in the header scan below: a put that
+        // lands between a header scan and a later counter read would be counted
+        // without being visible, and the gate could then pass while another
+        // visible header still has its body in flight.
+        const uint64_t landed = net.readSignal(sig);
         int my_valid = 0, num_valid = 0;
         for (int slot = 0; slot < num_sources; ++slot) {
             for (int sp = 0; sp < dispatch_subputs; ++sp) {
@@ -269,8 +275,7 @@ __forceinline__ __device__ void counted_wait_slices(
                 }
             }
         }
-        if (my_valid == upto_slice + 1 &&
-            net.readSignal(sig) >= prev_rounds + static_cast<uint64_t>(num_valid)) {
+        if (my_valid == upto_slice + 1 && landed >= prev_rounds + static_cast<uint64_t>(num_valid)) {
             return;
         }
     }
